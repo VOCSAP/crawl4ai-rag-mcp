@@ -40,6 +40,8 @@
 28. [T26 -- Erreur : search_code_examples sans USE_AGENTIC_RAG](#t26----erreur--search_code_examples-sans-use_agentic_rag)
 29. [T27 -- Robustesse : liste d'URLs avec doublons et URLs vides](#t27----robustesse--liste-durls-avec-doublons-et-urls-vides)
 30. [T28 -- Robustesse : query RAG vide](#t28----robustesse--query-rag-vide)
+31. [T29 -- Init lazy du crawler (Chromium)](#t29----init-lazy-du-crawler-chromium)
+32. [T30 -- Limite mémoire container (mem_limit)](#t30----limite-mémoire-container-mem_limit)
 
 ---
 
@@ -52,7 +54,7 @@ Avant d'exécuter tout scénario :
    ssh root@192.168.10.22
    cd /path/to/crawl4ai-rag-mcp
    docker compose ps
-   # Attendu : mcp-crawl4ai, postgres-rag, searxng, valkey, caddy -- tous Up
+   # Attendu : mcp-crawl4ai, postgres-rag, searxng, valkey -- tous Up (caddy desactive, gere par NPM)
    ```
 
 2. Claude Code est configuré pour se connecter au serveur MCP via SSE :
@@ -966,6 +968,98 @@ USE_AGENTIC_RAG=false
 
 ---
 
+## T29 -- Init lazy du crawler (Chromium)
+
+**Objectif :** Vérifier que Chromium n'est pas lancé au démarrage du serveur, uniquement lors du premier appel à un outil de crawl.
+
+**Prérequis :** Stack démarré depuis zéro (pas de crawl effectué depuis le dernier `docker compose up`).
+
+**Configuration `.env` requise :** Configuration minimale.
+
+**Étapes :**
+
+1. Démarrer le stack et observer les logs immédiats :
+   ```bash
+   docker compose up -d
+   docker logs mcp-crawl4ai --tail 20
+   ```
+   Attendu : `MCP server ready (Chromium will start on first crawl request)`. Aucune ligne `Crawler started`.
+
+2. Vérifier l'absence de processus Chromium dans le container :
+   ```bash
+   docker exec mcp-crawl4ai ps aux | grep -i chrom
+   ```
+   Attendu : aucun résultat (ou uniquement le processus `grep`).
+
+3. Mesurer la consommation mémoire à l'état idle (avant tout crawl) :
+   ```bash
+   docker stats mcp-crawl4ai --no-stream
+   ```
+   Attendu : `MEM USAGE` < 600 MB.
+
+4. Effectuer un premier crawl via Claude Code : "Utilise scrape_urls avec url='https://docs.python.org/3/library/json.html'."
+
+5. Observer les logs après le crawl :
+   ```bash
+   docker logs mcp-crawl4ai --tail 30 | grep -i crawler
+   ```
+   Attendu : `Crawler started (lazy init)` apparaît une seule fois.
+
+6. Re-vérifier la mémoire après le crawl :
+   ```bash
+   docker stats mcp-crawl4ai --no-stream
+   ```
+   Attendu : `MEM USAGE` augmente (Chromium chargé) mais reste < 2 GB.
+
+**Critère Pass :** Pas de Chromium au démarrage, message `Crawler started (lazy init)` lors du premier crawl, pas d'erreur de crawl.
+**Critère Fail :** Chromium visible dans `ps aux` avant tout crawl, ou erreur au premier crawl.
+
+---
+
+## T30 -- Limite mémoire container (mem_limit)
+
+**Objectif :** Vérifier que le container `mcp-crawl4ai` est bien limité à 2 GB et que le LXC ne peut plus être saturé par ce container.
+
+**Prérequis :** Stack démarré.
+
+**Configuration `.env` requise :** Configuration minimale.
+
+**Étapes :**
+
+1. Vérifier que le `mem_limit` est actif sur le container :
+   ```bash
+   docker inspect mcp-crawl4ai | python3 -c \
+     "import sys,json; d=json.load(sys.stdin)[0]; m=d['HostConfig']['Memory']; print(f'mem_limit={m} bytes ({m/1024**3:.1f} GB)')"
+   ```
+   Attendu : `mem_limit=2147483648 bytes (2.0 GB)`.
+
+2. Vérifier `memswap_limit` (doit aussi être 2 GB pour bloquer le swap overflow) :
+   ```bash
+   docker inspect mcp-crawl4ai | python3 -c \
+     "import sys,json; d=json.load(sys.stdin)[0]; m=d['HostConfig']['MemorySwap']; print(f'memswap_limit={m} bytes ({m/1024**3:.1f} GB)')"
+   ```
+   Attendu : `memswap_limit=2147483648 bytes (2.0 GB)`.
+
+3. Vérifier la consommation globale de RAM du LXC après démarrage complet du stack (avec un crawl effectué) :
+   ```bash
+   free -h
+   # Sur le LXC via SSH
+   ```
+   Attendu : RAM disponible > 1 GB (le LXC ne doit pas être saturé même avec Chromium chargé).
+
+4. Vérifier les limites sur les autres containers (postgres, searxng) :
+   ```bash
+   docker stats --no-stream
+   ```
+   Observer que chaque container reste dans des bornes raisonnables (postgres < 500 MB, searxng < 600 MB).
+
+**Critère Pass :** `mem_limit` confirmé à 2 GB, `memswap_limit` à 2 GB, LXC stable avec RAM disponible > 1 GB.
+**Critère Fail :** `mem_limit = 0` (pas de limite), ou LXC saturé lors du démarrage du stack.
+
+**Note :** Si `mem_limit` est correct mais que le container dépasse 2 GB à l'usage, Docker le tuera (OOMKill) et redémarrera. Cela est préférable à la saturation du LXC entier.
+
+---
+
 ## Matrice de couverture
 
 | Outil / Feature | Scénarios couverts |
@@ -997,3 +1091,5 @@ USE_AGENTIC_RAG=false
 | SearXNG injoignable | T25 |
 | Robustesse inputs | T27, T28 |
 | Connectivité SSE | T01 |
+| Lazy init Chromium | T29 |
+| Limite mémoire container | T30 |
