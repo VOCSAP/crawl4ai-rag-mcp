@@ -5,8 +5,9 @@ This server provides tools to crawl websites using Crawl4AI, automatically detec
 the appropriate crawl method based on URL type (sitemap, txt file, or regular webpage).
 Also includes AI hallucination detection and repository parsing tools using Neo4j knowledge graphs.
 """
+from __future__ import annotations
+
 from mcp.server.fastmcp import FastMCP, Context
-from sentence_transformers import CrossEncoder
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -20,6 +21,8 @@ import asyncio
 import json
 import os
 import re
+
+import openai
 import concurrent.futures
 import sys
 import time
@@ -122,7 +125,7 @@ class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
     crawler: AsyncWebCrawler
     db_conn: Any
-    reranking_model: Optional[CrossEncoder] = None
+    reranking_model: Optional[Any] = None
     knowledge_validator: Optional[Any] = None
     repo_extractor: Optional[Any] = None
 
@@ -150,15 +153,17 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     # Initialize database connection
     db_conn = get_db_conn()
     
-    # Initialize cross-encoder model for reranking if enabled
+    # Initialize local reranking model if backend=local
     reranking_model = None
-    if os.getenv("USE_RERANKING", "false") == "true":
+    if os.getenv("USE_RERANKING", "false") == "true" and os.getenv("RERANKING_BACKEND", "local") == "local":
         try:
-            reranking_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+            from sentence_transformers import CrossEncoder
+            local_model_name = os.getenv("RERANKING_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+            reranking_model = CrossEncoder(local_model_name)
+            print(f"Reranking model loaded (local CrossEncoder: {local_model_name})")
         except Exception as e:
-            print(f"Failed to load reranking model: {e}")
-            reranking_model = None
-    
+            print(f"Failed to load local reranking model: {e}")
+
     # Initialize Neo4j components if configured and enabled
     knowledge_validator = None
     repo_extractor = None
@@ -231,43 +236,59 @@ mcp = FastMCP(
     port=os.getenv("PORT", "8051")
 )
 
-def rerank_results(model: CrossEncoder, query: str, results: List[Dict[str, Any]], content_key: str = "content") -> List[Dict[str, Any]]:
-    """
-    Rerank search results using a cross-encoder model.
-    
-    Args:
-        model: The cross-encoder model to use for reranking
-        query: The search query
-        results: List of search results
-        content_key: The key in each result dict that contains the text content
-        
-    Returns:
-        Reranked list of results
-    """
-    if not model or not results:
-        return results
-    
+async def _rerank_local(model: Any, query: str, results: List[Dict[str, Any]], content_key: str) -> List[Dict[str, Any]]:
+    """Local CrossEncoder reranking (sync model wrapped in executor)."""
+    def _sync() -> List[Dict[str, Any]]:
+        texts = [r.get(content_key, "") for r in results]
+        scores = model.predict([[query, t] for t in texts])
+        for i, r in enumerate(results):
+            r["rerank_score"] = float(scores[i])
+        return sorted(results, key=lambda x: x.get("rerank_score", 0), reverse=True)
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _sync)
+
+
+async def _rerank_remote(query: str, results: List[Dict[str, Any]], content_key: str) -> List[Dict[str, Any]]:
+    """Remote LLM reranking via Ollama/LiteLLM using RankGPT listwise approach."""
+    llm_model = os.getenv("RERANKING_MODEL") or os.getenv("MODEL_CHOICE", "qwen3.5:4b")
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434") + "/v1"
+    client = openai.AsyncOpenAI(base_url=base_url, api_key=os.getenv("OPENAI_API_KEY", "ollama"))
+
+    snippets = [r.get(content_key, "")[:600] for r in results]
+    numbered = "\n".join(f"[{i + 1}] {s}" for i, s in enumerate(snippets))
+    prompt = (
+        f'Search query: "{query}"\n\n'
+        f"Rank the following {len(results)} documents from most to least relevant.\n"
+        f"Output ONLY a comma-separated list of numbers, e.g.: 3,1,2\n\n"
+        f"Documents:\n{numbered}\n\nRanking:"
+    )
+
     try:
-        # Extract content from results
-        texts = [result.get(content_key, "") for result in results]
-        
-        # Create pairs of [query, document] for the cross-encoder
-        pairs = [[query, text] for text in texts]
-        
-        # Get relevance scores from the cross-encoder
-        scores = model.predict(pairs)
-        
-        # Add scores to results and sort by score (descending)
-        for i, result in enumerate(results):
-            result["rerank_score"] = float(scores[i])
-        
-        # Sort by rerank score
-        reranked = sorted(results, key=lambda x: x.get("rerank_score", 0), reverse=True)
-        
-        return reranked
+        response = await client.chat.completions.create(
+            model=llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=64,
+        )
+        raw = response.choices[0].message.content.strip()
+        indices = [int(x.strip()) - 1 for x in raw.split(",") if x.strip().isdigit()]
+        valid = [i for i in indices if 0 <= i < len(results)]
+        missing = [i for i in range(len(results)) if i not in valid]
+        return [results[i] for i in valid + missing]
     except Exception as e:
-        print(f"Error during reranking: {e}")
+        print(f"Error during remote reranking: {e}")
         return results
+
+
+async def rerank_results(query: str, results: List[Dict[str, Any]], content_key: str = "content", model: Any = None) -> List[Dict[str, Any]]:
+    """Dispatch to local CrossEncoder or remote LLM reranking based on RERANKING_BACKEND."""
+    if not results:
+        return results
+    backend = os.getenv("RERANKING_BACKEND", "local")
+    if backend == "local" and model is not None:
+        return await _rerank_local(model, query, results, content_key)
+    return await _rerank_remote(query, results, content_key)
 
 def is_sitemap(url: str) -> bool:
     """
@@ -1636,22 +1657,18 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
         
         # Apply reranking if enabled and we have results
         use_reranking = os.getenv("USE_RERANKING", "false") == "true"
-        if use_reranking and results and ctx.request_context.lifespan_context.reranking_model:
+        if use_reranking and results:
+            reranking_timeout = float(os.getenv("RERANKING_TIMEOUT", "60"))
             try:
-                print("Applying reranking...")
-                reranked_results = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: rerank_results(
-                            ctx.request_context.lifespan_context.reranking_model,
-                            query,
-                            results,
-                            content_key="content"
-                        )
+                backend = os.getenv("RERANKING_BACKEND", "local")
+                print(f"Applying reranking (backend={backend})...")
+                results = await asyncio.wait_for(
+                    rerank_results(
+                        query, results, content_key="content",
+                        model=ctx.request_context.lifespan_context.reranking_model
                     ),
-                    timeout=10.0
+                    timeout=reranking_timeout
                 )
-                results = reranked_results
                 print("Reranking completed")
             except asyncio.TimeoutError:
                 print("Reranking timed out, using original results")
@@ -1684,7 +1701,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
             "query": query,
             "source_filter": source,
             "search_mode": "hybrid" if use_hybrid_search else "vector",
-            "reranking_applied": use_reranking and ctx.request_context.lifespan_context.reranking_model is not None,
+            "reranking_applied": use_reranking,
             "results": formatted_results,
             "count": len(formatted_results),
             "processing_time_seconds": round(processing_time, 2)
@@ -1811,8 +1828,20 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
         
         # Apply reranking if enabled
         use_reranking = os.getenv("USE_RERANKING", "false") == "true"
-        if use_reranking and ctx.request_context.lifespan_context.reranking_model:
-            results = rerank_results(ctx.request_context.lifespan_context.reranking_model, query, results, content_key="content")
+        if use_reranking and results:
+            reranking_timeout = float(os.getenv("RERANKING_TIMEOUT", "60"))
+            try:
+                results = await asyncio.wait_for(
+                    rerank_results(
+                        query, results, content_key="content",
+                        model=ctx.request_context.lifespan_context.reranking_model
+                    ),
+                    timeout=reranking_timeout
+                )
+            except asyncio.TimeoutError:
+                print("Reranking timed out, using original results")
+            except Exception as e:
+                print(f"Reranking failed: {e}, using original results")
         
         # Format the results
         formatted_results = []
@@ -1835,7 +1864,7 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
             "query": query,
             "source_filter": source_id,
             "search_mode": "hybrid" if use_hybrid_search else "vector",
-            "reranking_applied": use_reranking and ctx.request_context.lifespan_context.reranking_model is not None,
+            "reranking_applied": use_reranking,
             "results": formatted_results,
             "count": len(formatted_results)
         }, indent=2)
