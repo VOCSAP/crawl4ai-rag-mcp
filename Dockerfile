@@ -30,6 +30,9 @@ RUN pip install uv
 # Copy the MCP server files
 COPY . .
 
+# Install CPU-only torch first to prevent sentence-transformers from pulling CUDA variant (~2 GB)
+RUN uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+
 # Install packages directly to the system (no virtual environment)
 # Combining commands to reduce Docker layers
 RUN uv pip install --system -e . && \
