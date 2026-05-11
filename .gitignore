@@ -5,3 +5,10 @@ crawl4ai_mcp.egg-info
 repos
 .claude
 test_script_hallucination*
+
+# Planning files
+task_plan.md
+findings.md
+progress.md
+crawl4ai-rag-mcp-plan.md
+.planning/
