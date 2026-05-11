@@ -14,7 +14,6 @@ from typing import List, Dict, Any, Optional, Union
 from urllib.parse import urlparse, urldefrag
 from xml.etree import ElementTree
 from dotenv import load_dotenv
-from supabase import Client
 from pathlib import Path
 import requests
 import asyncio
@@ -32,15 +31,19 @@ knowledge_graphs_path = Path(__file__).resolve().parent.parent / 'knowledge_grap
 sys.path.append(str(knowledge_graphs_path))
 
 from utils import (
-    get_supabase_client, 
-    add_documents_to_supabase, 
+    get_db_conn,
+    add_documents_to_db,
     search_documents,
     extract_code_blocks,
     generate_code_example_summary,
-    add_code_examples_to_supabase,
+    add_code_examples_to_db,
     update_source_info,
     extract_source_summary,
-    search_code_examples
+    search_code_examples as search_code_examples_util,
+    get_raw_content_by_url,
+    get_all_sources,
+    keyword_search_crawled_pages,
+    keyword_search_code_examples,
 )
 
 # Import knowledge graph modules
@@ -118,10 +121,10 @@ def validate_github_url(repo_url: str) -> Dict[str, Any]:
 class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
     crawler: AsyncWebCrawler
-    supabase_client: Client
+    db_conn: Any
     reranking_model: Optional[CrossEncoder] = None
-    knowledge_validator: Optional[Any] = None  # KnowledgeGraphValidator when available
-    repo_extractor: Optional[Any] = None       # DirectNeo4jExtractor when available
+    knowledge_validator: Optional[Any] = None
+    repo_extractor: Optional[Any] = None
 
 @asynccontextmanager
 async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
@@ -144,8 +147,8 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     crawler = AsyncWebCrawler(config=browser_config)
     await crawler.__aenter__()
     
-    # Initialize Supabase client
-    supabase_client = get_supabase_client()
+    # Initialize database connection
+    db_conn = get_db_conn()
     
     # Initialize cross-encoder model for reranking if enabled
     reranking_model = None
@@ -194,7 +197,7 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     try:
         yield Crawl4AIContext(
             crawler=crawler,
-            supabase_client=supabase_client,
+            db_conn=db_conn,
             reranking_model=reranking_model,
             knowledge_validator=knowledge_validator,
             repo_extractor=repo_extractor
@@ -202,6 +205,10 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     finally:
         # Clean up all components
         await crawler.__aexit__(None, None, None)
+        try:
+            db_conn.close()
+        except Exception:
+            pass
         if knowledge_validator:
             try:
                 await knowledge_validator.close()
@@ -542,26 +549,16 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
         
         if return_raw_markdown:
             # Raw markdown mode - just return scraped content without RAG
-            # Get content from database for each URL
-            supabase_client = ctx.request_context.lifespan_context.supabase_client
-            
+            db_conn = ctx.request_context.lifespan_context.db_conn
+
             for url in valid_urls:
                 try:
-                    # Query the database for content from this URL
-                    result = supabase_client.from_('crawled_pages')\
-                        .select('content')\
-                        .eq('url', url)\
-                        .execute()
-                    
-                    if result.data:
-                        # Combine all chunks for this URL
-                        content_chunks = [row['content'] for row in result.data]
-                        combined_content = '\n\n'.join(content_chunks)
-                        results_data[url] = combined_content
+                    content_chunks = get_raw_content_by_url(db_conn, url)
+                    if content_chunks:
+                        results_data[url] = '\n\n'.join(content_chunks)
                         processed_urls += 1
                     else:
                         results_data[url] = "No content found"
-                        
                 except Exception as e:
                     results_data[url] = f"Error retrieving content: {str(e)}"
         
@@ -745,11 +742,11 @@ async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: 
         
         # Get context components
         crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        db_conn = ctx.request_context.lifespan_context.db_conn
         
         # Always use unified processing (handles both single and multiple URLs seamlessly)
         return await _process_multiple_urls(
-            crawler, supabase_client, urls_to_process,
+            crawler, db_conn, urls_to_process,
             max_concurrent, batch_size, start_time, return_raw_markdown
         )
             
@@ -765,7 +762,7 @@ async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: 
 
 async def _process_multiple_urls(
     crawler: AsyncWebCrawler,
-    supabase_client: Client,
+    db_conn: Any,
     urls: List[str],
     max_concurrent: int,
     batch_size: int,
@@ -781,7 +778,7 @@ async def _process_multiple_urls(
     
     Args:
         crawler: AsyncWebCrawler instance
-        supabase_client: Supabase client
+        db_conn: Supabase client
         urls: List of URLs to process (can be single URL or multiple)
         max_concurrent: Maximum concurrent browser sessions
         batch_size: Batch size for database operations
@@ -951,12 +948,12 @@ async def _process_multiple_urls(
             
             for (source_id, _), summary in zip(source_summary_args, source_summaries):
                 word_count = source_word_counts.get(source_id, 0)
-                update_source_info(supabase_client, source_id, summary, word_count)
+                update_source_info(db_conn, source_id, summary, word_count)
         
         # Add documentation chunks to Supabase in batches (if any)
         if all_contents:
-            add_documents_to_supabase(
-                supabase_client,
+            add_documents_to_db(
+                db_conn,
                 all_urls,
                 all_chunk_numbers,
                 all_contents,
@@ -1010,8 +1007,8 @@ async def _process_multiple_urls(
             
             # Add all code examples to Supabase
             if code_examples:
-                add_code_examples_to_supabase(
-                    supabase_client,
+                add_code_examples_to_db(
+                    db_conn,
                     code_urls,
                     code_chunk_numbers,
                     code_examples,
@@ -1131,7 +1128,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
     try:
         # Get the crawler from the context
         crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        db_conn = ctx.request_context.lifespan_context.db_conn
         
         # Determine the crawl strategy
         crawl_results = []
@@ -1241,11 +1238,11 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         
         for (source_id, _), summary in zip(source_summary_args, source_summaries):
             word_count = source_word_counts.get(source_id, 0)
-            update_source_info(supabase_client, source_id, summary, word_count)
+            update_source_info(db_conn, source_id, summary, word_count)
         
         # Add documentation chunks to Supabase (AFTER sources exist)
         batch_size = 20
-        add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
+        add_documents_to_db(db_conn, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
         
         # Extract and process code examples from all documents only if enabled
         code_examples = []
@@ -1295,8 +1292,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             
             # Add all code examples to Supabase
             if code_examples:
-                add_code_examples_to_supabase(
-                    supabase_client,
+                add_code_examples_to_db(
+                    db_conn,
                     code_urls,
                     code_chunk_numbers,
                     code_examples,
@@ -1416,27 +1413,20 @@ async def get_available_sources(ctx: Context) -> str:
         JSON string with the list of available sources and their details
     """
     try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
-        
-        # Query the sources table directly
-        result = supabase_client.from_('sources')\
-            .select('*')\
-            .order('source_id')\
-            .execute()
-        
-        # Format the sources with their details
-        sources = []
-        if result.data:
-            for source in result.data:
-                sources.append({
-                    "source_id": source.get("source_id"),
-                    "summary": source.get("summary"),
-                    "total_words": source.get("total_words"),
-                    "created_at": source.get("created_at"),
-                    "updated_at": source.get("updated_at")
-                })
-        
+        db_conn = ctx.request_context.lifespan_context.db_conn
+        rows = get_all_sources(db_conn)
+
+        sources = [
+            {
+                "source_id": r.get("source_id"),
+                "summary": r.get("summary"),
+                "total_words": r.get("total_word_count"),
+                "created_at": str(r.get("created_at", "")),
+                "updated_at": str(r.get("updated_at", "")),
+            }
+            for r in rows
+        ]
+
         return json.dumps({
             "success": True,
             "sources": sources,
@@ -1496,9 +1486,9 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                 }, indent=2)
         
         # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        db_conn = ctx.request_context.lifespan_context.db_conn
         
-        if not supabase_client:
+        if not db_conn:
             return json.dumps({
                 "success": False,
                 "error": "Database client not available"
@@ -1526,7 +1516,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                         asyncio.get_event_loop().run_in_executor(
                             None,
                             lambda: search_documents(
-                                client=supabase_client,
+                                conn=db_conn,
                                 query=query,
                                 match_count=match_count * 2,  # Get double to have room for filtering
                                 source_id_filter=source  # Use source_id_filter instead of filter_metadata
@@ -1545,23 +1535,15 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                 # 2. Get keyword search results with timeout (10 seconds)
                 print("Executing keyword search...")
                 try:
-                    keyword_query = supabase_client.from_('crawled_pages')\
-                        .select('id, url, chunk_number, content, metadata, source_id')\
-                        .ilike('content', f'%{query}%')
-                    
-                    # Apply source filter if provided
-                    if source:
-                        keyword_query = keyword_query.eq('source_id', source)
-                    
-                    # Execute keyword search with timeout
-                    keyword_response = await asyncio.wait_for(
+                    keyword_results = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
                             None,
-                            lambda: keyword_query.limit(match_count * 2).execute()
+                            lambda: keyword_search_crawled_pages(
+                                db_conn, query, source, match_count * 2
+                            )
                         ),
                         timeout=10.0
                     )
-                    keyword_results = keyword_response.data if keyword_response.data else []
                     print(f"Keyword search completed: {len(keyword_results)} results")
                 except asyncio.TimeoutError:
                     print("Keyword search timed out")
@@ -1628,7 +1610,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                     asyncio.get_event_loop().run_in_executor(
                         None,
                         lambda: search_documents(
-                            client=supabase_client,
+                            conn=db_conn,
                             query=query,
                             match_count=match_count,
                             source_id_filter=source  # Use source_id_filter instead of filter_metadata
@@ -1748,7 +1730,7 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
     
     try:
         # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        db_conn = ctx.request_context.lifespan_context.db_conn
         
         # Check if hybrid search is enabled
         use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
@@ -1760,30 +1742,21 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
         
         if use_hybrid_search:
             # Hybrid search: combine vector and keyword search
-            
-            # Import the search function from utils
-            from utils import search_code_examples as search_code_examples_impl
-            
+
             # 1. Get vector search results (get more to account for filtering)
-            vector_results = search_code_examples_impl(
-                client=supabase_client,
+            vector_results = search_code_examples_util(
+                conn=db_conn,
                 query=query,
-                match_count=match_count * 2,  # Get double to have room for filtering
+                match_count=match_count * 2,
                 filter_metadata=filter_metadata
             )
             
             # 2. Get keyword search results using ILIKE on both content and summary
-            keyword_query = supabase_client.from_('code_examples')\
-                .select('id, url, chunk_number, content, summary, metadata, source_id')\
-                .or_(f'content.ilike.%{query}%,summary.ilike.%{query}%')
-            
-            # Apply source filter if provided
-            if source_id and source_id.strip():
-                keyword_query = keyword_query.eq('source_id', source_id)
-            
-            # Execute keyword search
-            keyword_response = keyword_query.limit(match_count * 2).execute()
-            keyword_results = keyword_response.data if keyword_response.data else []
+            keyword_results = keyword_search_code_examples(
+                db_conn, query,
+                source_id if (source_id and source_id.strip()) else None,
+                match_count * 2
+            )
             
             # 3. Combine results with preference for items appearing in both
             seen_ids = set()
@@ -1829,10 +1802,8 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
             
         else:
             # Standard vector search only
-            from utils import search_code_examples as search_code_examples_impl
-            
-            results = search_code_examples_impl(
-                client=supabase_client,
+            results = search_code_examples_util(
+                conn=db_conn,
                 query=query,
                 match_count=match_count,
                 filter_metadata=filter_metadata
@@ -1874,6 +1845,173 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
             "query": query,
             "error": str(e)
         }, indent=2)
+
+def _searxng_request(query: str, categories: str, engines: str = None,
+                     language: str = None, pageno: int = 1,
+                     num_results: int = 10) -> dict:
+    """Execute a SearXNG search request and return parsed JSON."""
+    searxng_url = os.getenv("SEARXNG_URL", "").rstrip("/")
+    if not searxng_url:
+        return {"success": False, "error": "SEARXNG_URL environment variable is not configured"}
+
+    params = {
+        "q": query,
+        "format": "json",
+        "categories": categories,
+        "pageno": pageno,
+        "limit": num_results,
+    }
+    if engines:
+        params["engines"] = engines
+    if language:
+        params["language"] = language
+
+    headers = {
+        "User-Agent": os.getenv("SEARXNG_USER_AGENT", "MCP-Crawl4AI-RAG-Server/1.0"),
+        "Accept": "application/json",
+    }
+    timeout = int(os.getenv("SEARXNG_TIMEOUT", "30"))
+
+    try:
+        response = requests.get(f"{searxng_url}/search", params=params,
+                                headers=headers, timeout=timeout)
+        response.raise_for_status()
+        return {"success": True, "data": response.json()}
+    except requests.exceptions.Timeout:
+        return {"success": False, "error": f"SearXNG request timed out after {timeout}s"}
+    except requests.exceptions.ConnectionError:
+        return {"success": False, "error": f"Cannot connect to SearXNG at {searxng_url}"}
+    except requests.exceptions.HTTPError as e:
+        return {"success": False, "error": f"SearXNG HTTP error: {e}"}
+    except Exception as e:
+        return {"success": False, "error": f"SearXNG request failed: {str(e)}"}
+
+
+@mcp.tool()
+async def searxng_search(ctx: Context, query: str, categories: str = "general",
+                         engines: str = None, language: str = None,
+                         pageno: int = 1, num_results: int = 10) -> str:
+    """
+    Search the web using SearXNG. Returns titles, URLs, and snippets without scraping or RAG.
+
+    Use this for quick web searches where raw result links and summaries are sufficient.
+    For deep content retrieval with RAG, use the 'search' tool instead.
+
+    Args:
+        query: The search query
+        categories: Comma-separated SearXNG categories (default: general)
+        engines: Comma-separated engine names (e.g. 'google,bing,duckduckgo')
+        language: Search language (e.g. 'en', 'fr')
+        pageno: Page number (default: 1)
+        num_results: Number of results to return (default: 10)
+
+    Returns:
+        JSON string with search results (title, url, snippet, engine)
+    """
+    result = _searxng_request(query, categories, engines, language, pageno, num_results)
+    if not result["success"]:
+        return json.dumps({"success": False, "query": query, "error": result["error"]}, indent=2)
+
+    data = result["data"]
+    results = [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "snippet": r.get("content", ""),
+            "engine": r.get("engine", ""),
+        }
+        for r in data.get("results", [])[:num_results]
+    ]
+
+    return json.dumps({
+        "success": True,
+        "query": query,
+        "categories": categories,
+        "results": results,
+        "count": len(results),
+    }, indent=2)
+
+
+@mcp.tool()
+async def searxng_images(ctx: Context, query: str, engines: str = None,
+                         language: str = None, pageno: int = 1,
+                         num_results: int = 10) -> str:
+    """
+    Search for images using SearXNG. Returns image URLs and thumbnails directly.
+
+    Args:
+        query: The image search query
+        engines: Comma-separated engine names
+        language: Search language (e.g. 'en', 'fr')
+        pageno: Page number (default: 1)
+        num_results: Number of results to return (default: 10)
+
+    Returns:
+        JSON string with image results (title, url, thumbnail_src, source)
+    """
+    result = _searxng_request(query, "images", engines, language, pageno, num_results)
+    if not result["success"]:
+        return json.dumps({"success": False, "query": query, "error": result["error"]}, indent=2)
+
+    data = result["data"]
+    results = [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "thumbnail_src": r.get("thumbnail_src", ""),
+            "source": r.get("source", ""),
+        }
+        for r in data.get("results", [])[:num_results]
+    ]
+
+    return json.dumps({
+        "success": True,
+        "query": query,
+        "results": results,
+        "count": len(results),
+    }, indent=2)
+
+
+@mcp.tool()
+async def searxng_news(ctx: Context, query: str, engines: str = None,
+                       language: str = None, pageno: int = 1,
+                       num_results: int = 10) -> str:
+    """
+    Search for recent news articles using SearXNG. Returns titles, URLs, and summaries directly.
+
+    Args:
+        query: The news search query
+        engines: Comma-separated engine names
+        language: Search language (e.g. 'en', 'fr')
+        pageno: Page number (default: 1)
+        num_results: Number of results to return (default: 10)
+
+    Returns:
+        JSON string with news results (title, url, snippet, publishedDate, engine)
+    """
+    result = _searxng_request(query, "news", engines, language, pageno, num_results)
+    if not result["success"]:
+        return json.dumps({"success": False, "query": query, "error": result["error"]}, indent=2)
+
+    data = result["data"]
+    results = [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "snippet": r.get("content", ""),
+            "publishedDate": r.get("publishedDate", ""),
+            "engine": r.get("engine", ""),
+        }
+        for r in data.get("results", [])[:num_results]
+    ]
+
+    return json.dumps({
+        "success": True,
+        "query": query,
+        "results": results,
+        "count": len(results),
+    }, indent=2)
+
 
 @mcp.tool()
 async def check_ai_script_hallucinations(ctx: Context, script_path: str) -> str:

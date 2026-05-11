@@ -1,6 +1,26 @@
 version: "3.7"
 
 services:
+  # PostgreSQL with pgvector
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres-rag
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-rag}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rag}
+      - POSTGRES_DB=${POSTGRES_DB:-ragdb}
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+      - ./crawled_pages.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - searxng
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"
+
   # MCP Crawl4AI Server
   mcp-crawl4ai:
     build:
@@ -19,6 +39,7 @@ services:
       - "8051:8051"
     depends_on:
       - searxng
+      - postgres
     networks:
       - searxng
     volumes:
@@ -112,3 +133,4 @@ volumes:
   caddy-config:
   valkey-data:
   searxng-data:
+  pgvector_data:
