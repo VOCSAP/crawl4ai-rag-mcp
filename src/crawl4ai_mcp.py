@@ -5,8 +5,6 @@ This server provides tools to crawl websites using Crawl4AI, automatically detec
 the appropriate crawl method based on URL type (sitemap, txt file, or regular webpage).
 Also includes AI hallucination detection and repository parsing tools using Neo4j knowledge graphs.
 """
-from __future__ import annotations
-
 from mcp.server.fastmcp import FastMCP, Context
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
