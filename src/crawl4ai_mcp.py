@@ -121,34 +121,44 @@ def validate_github_url(repo_url: str) -> Dict[str, Any]:
 @dataclass
 class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
-    crawler: AsyncWebCrawler
-    db_conn: Any
+    _crawler: Optional[AsyncWebCrawler] = None
+    _crawler_lock: Optional[asyncio.Lock] = None
+    db_conn: Any = None
     reranking_model: Optional[Any] = None
     knowledge_validator: Optional[Any] = None
     repo_extractor: Optional[Any] = None
+
+    async def get_crawler(self) -> AsyncWebCrawler:
+        """Return the crawler, starting it lazily on first call."""
+        if self._crawler is not None:
+            return self._crawler
+        if self._crawler_lock is None:
+            self._crawler_lock = asyncio.Lock()
+        async with self._crawler_lock:
+            if self._crawler is None:
+                browser_config = BrowserConfig(headless=True, verbose=False)
+                self._crawler = AsyncWebCrawler(config=browser_config)
+                await self._crawler.__aenter__()
+                print("Crawler started (lazy init)")
+        return self._crawler
+
+    async def close_crawler(self):
+        if self._crawler is not None:
+            await self._crawler.__aexit__(None, None, None)
+            self._crawler = None
 
 @asynccontextmanager
 async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     """
     Manages the Crawl4AI client lifecycle.
-    
+
     Args:
         server: The FastMCP server instance
-        
+
     Yields:
         Crawl4AIContext: The context containing the Crawl4AI crawler and Supabase client
     """
-    # Create browser configuration
-    browser_config = BrowserConfig(
-        headless=True,
-        verbose=False
-    )
-    
-    # Initialize the crawler
-    crawler = AsyncWebCrawler(config=browser_config)
-    await crawler.__aenter__()
-    
-    # Initialize database connection
+    # Initialize database connection (fast, no Chromium)
     db_conn = get_db_conn()
     
     # Initialize local reranking model if backend=local
@@ -197,17 +207,17 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     else:
         print("Knowledge graph functionality disabled - set USE_KNOWLEDGE_GRAPH=true to enable")
     
+    ctx = Crawl4AIContext(
+        db_conn=db_conn,
+        reranking_model=reranking_model,
+        knowledge_validator=knowledge_validator,
+        repo_extractor=repo_extractor
+    )
+    print("MCP server ready (Chromium will start on first crawl request)")
     try:
-        yield Crawl4AIContext(
-            crawler=crawler,
-            db_conn=db_conn,
-            reranking_model=reranking_model,
-            knowledge_validator=knowledge_validator,
-            repo_extractor=repo_extractor
-        )
+        yield ctx
     finally:
-        # Clean up all components
-        await crawler.__aexit__(None, None, None)
+        await ctx.close_crawler()
         try:
             db_conn.close()
         except Exception:
@@ -760,9 +770,9 @@ async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: 
             }, indent=2)
         
         # Get context components
-        crawler = ctx.request_context.lifespan_context.crawler
+        crawler = await ctx.request_context.lifespan_context.get_crawler()
         db_conn = ctx.request_context.lifespan_context.db_conn
-        
+
         # Always use unified processing (handles both single and multiple URLs seamlessly)
         return await _process_multiple_urls(
             crawler, db_conn, urls_to_process,
@@ -1146,9 +1156,9 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
     """
     try:
         # Get the crawler from the context
-        crawler = ctx.request_context.lifespan_context.crawler
+        crawler = await ctx.request_context.lifespan_context.get_crawler()
         db_conn = ctx.request_context.lifespan_context.db_conn
-        
+
         # Determine the crawl strategy
         crawl_results = []
         crawl_type = None
