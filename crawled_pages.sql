@@ -23,12 +23,12 @@ create table crawled_pages (
     content text not null,
     metadata jsonb not null default '{}'::jsonb,
     source_id text not null,
-    embedding vector(1536),  -- OpenAI embeddings are 1536 dimensions
+    embedding vector(768),
     created_at timestamp with time zone default timezone('utc'::text, now()) not null,
-    
+
     -- Add a unique constraint to prevent duplicate chunks for the same URL
     unique(url, chunk_number),
-    
+
     -- Add foreign key constraint to sources table
     foreign key (source_id) references sources(source_id)
 );
@@ -44,7 +44,7 @@ CREATE INDEX idx_crawled_pages_source_id ON crawled_pages (source_id);
 
 -- Create a function to search for documentation chunks
 create or replace function match_crawled_pages (
-  query_embedding vector(1536),
+  query_embedding vector(768),
   match_count int default 10,
   filter jsonb DEFAULT '{}'::jsonb,
   source_filter text DEFAULT NULL
@@ -78,25 +78,6 @@ begin
 end;
 $$;
 
--- Enable RLS on the crawled_pages table
-alter table crawled_pages enable row level security;
-
--- Create a policy that allows anyone to read crawled_pages
-create policy "Allow public read access to crawled_pages"
-  on crawled_pages
-  for select
-  to public
-  using (true);
-
--- Enable RLS on the sources table
-alter table sources enable row level security;
-
--- Create a policy that allows anyone to read sources
-create policy "Allow public read access to sources"
-  on sources
-  for select
-  to public
-  using (true);
 
 -- Create the code_examples table
 create table code_examples (
@@ -107,12 +88,12 @@ create table code_examples (
     summary text not null,  -- Summary of the code example
     metadata jsonb not null default '{}'::jsonb,
     source_id text not null,
-    embedding vector(1536),  -- OpenAI embeddings are 1536 dimensions
+    embedding vector(768),
     created_at timestamp with time zone default timezone('utc'::text, now()) not null,
-    
+
     -- Add a unique constraint to prevent duplicate chunks for the same URL
     unique(url, chunk_number),
-    
+
     -- Add foreign key constraint to sources table
     foreign key (source_id) references sources(source_id)
 );
@@ -128,7 +109,7 @@ CREATE INDEX idx_code_examples_source_id ON code_examples (source_id);
 
 -- Create a function to search for code examples
 create or replace function match_code_examples (
-  query_embedding vector(1536),
+  query_embedding vector(768),
   match_count int default 10,
   filter jsonb DEFAULT '{}'::jsonb,
   source_filter text DEFAULT NULL
@@ -164,12 +145,3 @@ begin
 end;
 $$;
 
--- Enable RLS on the code_examples table
-alter table code_examples enable row level security;
-
--- Create a policy that allows anyone to read code_examples
-create policy "Allow public read access to code_examples"
-  on code_examples
-  for select
-  to public
-  using (true);
