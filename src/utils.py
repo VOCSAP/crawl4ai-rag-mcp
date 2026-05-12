@@ -18,7 +18,9 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIMENSIONS", "768"))
 def _get_openai_client() -> openai.OpenAI:
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434") + "/v1"
     api_key = os.getenv("OPENAI_API_KEY", "ollama")
-    return openai.OpenAI(base_url=base_url, api_key=api_key)
+    timeout = float(os.getenv("LLM_TIMEOUT", "60"))
+    return openai.OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+
 
 
 def get_db_conn():
@@ -183,8 +185,9 @@ def add_documents_to_db(
                 full_document = url_to_full_document.get(url, "")
                 process_args.append((url, content, full_document))
 
+            contextual_workers = int(os.getenv("CONTEXTUAL_EMBEDDING_WORKERS", "2"))
             contextual_contents = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=contextual_workers) as executor:
                 future_to_idx = {executor.submit(process_chunk_with_context, arg): idx
                                  for idx, arg in enumerate(process_args)}
 
