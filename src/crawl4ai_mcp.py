@@ -278,6 +278,7 @@ async def _rerank_remote(query: str, results: List[Dict[str, Any]], content_key:
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=64,
+            extra_body={"think": False},
         )
         raw = response.choices[0].message.content.strip()
         indices = [int(x.strip()) - 1 for x in raw.split(",") if x.strip().isdigit()]
