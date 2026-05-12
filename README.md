@@ -257,6 +257,14 @@ When enabled, this strategy enhances each chunk's embedding with additional cont
 - **Trade-offs**: Slower indexing due to LLM calls for each chunk, but significantly better retrieval accuracy.
 - **Cost**: Additional LLM API calls during indexing.
 
+**Tuning variables for local LLM deployments (Ollama):**
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_TIMEOUT` | `60` | Timeout in seconds for all LLM calls. Increase for CPU-backed Ollama instances. |
+| `CONTEXTUAL_EMBEDDING_WORKERS` | `2` | Max parallel LLM calls per batch. Keep at 1-2 when Ollama processes one request at a time. |
+| `CONTEXTUAL_DOC_TRUNCATION` | `8000` | Max chars of the full document sent as context. Must fit within the model context window (qwen3.5:4b = 4096 tokens; 8000 chars ~ 2000 tokens). Increase for models with larger context windows. |
+
 #### 2. **USE_HYBRID_SEARCH**
 Combines traditional keyword search with semantic vector search to provide more comprehensive results. The system performs both searches in parallel and intelligently merges results, prioritizing documents that appear in both result sets.
 
