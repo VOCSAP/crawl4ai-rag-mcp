@@ -109,7 +109,8 @@ Please give a short succinct context to situate this chunk within the overall do
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_tokens=200
+            max_tokens=200,
+            extra_body={"think": False}
         )
 
         context = response.choices[0].message.content.strip()
@@ -446,7 +447,8 @@ Based on the code example and its surrounding context, provide a concise summary
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_tokens=2000
+            max_tokens=2000,
+            extra_body={"think": False}
         )
 
         return response.choices[0].message.content.strip()
@@ -629,7 +631,8 @@ The above content is from the documentation for '{source_id}'. Please provide a 
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_tokens=150
+            max_tokens=150,
+            extra_body={"think": False}
         )
 
         summary = response.choices[0].message.content.strip()
