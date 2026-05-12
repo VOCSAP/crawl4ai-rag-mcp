@@ -6,9 +6,16 @@ repos
 .claude
 test_script_hallucination*
 
-# Planning files
+# Graphify output cache
+graphify-out/
+
+# Planning and session-local files (not part of the public repo)
 task_plan.md
 findings.md
 progress.md
 crawl4ai-rag-mcp-plan.md
 .planning/
+TEST_RESULTS.md
+test_agentic.py
+CLAUDE.md
+KNOWN_ISSUES.md
