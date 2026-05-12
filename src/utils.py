@@ -93,9 +93,10 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
     """
     model_choice = os.getenv("MODEL_CHOICE")
 
+    doc_truncation = int(os.getenv("CONTEXTUAL_DOC_TRUNCATION", "8000"))
     try:
         prompt = f"""<document>
-{full_document[:25000]}
+{full_document[:doc_truncation]}
 </document>
 Here is the chunk we want to situate within the whole document
 <chunk>
