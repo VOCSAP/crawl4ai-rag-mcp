@@ -5,6 +5,10 @@ This server provides tools to crawl websites using Crawl4AI, automatically detec
 the appropriate crawl method based on URL type (sitemap, txt file, or regular webpage).
 Also includes AI hallucination detection and repository parsing tools using Neo4j knowledge graphs.
 """
+# Apply ServerSession init-race workaround BEFORE FastMCP creates any session.
+# See src/mcp_init_patch.py and KNOWN_ISSUES.md section I.
+import mcp_init_patch  # noqa: F401
+
 from mcp.server.fastmcp import FastMCP, Context
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
