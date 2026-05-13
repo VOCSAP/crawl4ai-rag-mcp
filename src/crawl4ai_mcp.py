@@ -1761,11 +1761,13 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
         # Check if hybrid search is enabled
         use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
         
-        # Prepare filter if source is provided and not empty
-        filter_metadata = None
-        if source_id and source_id.strip():
-            filter_metadata = {"source": source_id}
-        
+        # Prepare source filter if provided and not empty. The vector search
+        # is filtered through the dedicated `source_id` parameter of
+        # `match_code_examples` rather than via `metadata @> filter`, because
+        # the source is stored in its own column (`source_id`) and not under
+        # any key of the JSONB `metadata` column at insertion time.
+        source_filter = source_id if (source_id and source_id.strip()) else None
+
         if use_hybrid_search:
             # Hybrid search: combine vector and keyword search
 
@@ -1774,13 +1776,13 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
                 conn=db_conn,
                 query=query,
                 match_count=match_count * 2,
-                filter_metadata=filter_metadata
+                source_id=source_filter
             )
             
             # 2. Get keyword search results using ILIKE on both content and summary
             keyword_results = keyword_search_code_examples(
                 db_conn, query,
-                source_id if (source_id and source_id.strip()) else None,
+                source_filter,
                 match_count * 2
             )
             
@@ -1832,7 +1834,7 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
                 conn=db_conn,
                 query=query,
                 match_count=match_count,
-                filter_metadata=filter_metadata
+                source_id=source_filter
             )
         
         # Apply reranking if enabled
@@ -2728,6 +2730,18 @@ async def parse_github_repository(ctx: Context, repo_url: str) -> str:
             "error": f"Repository parsing failed: {str(e)}"
         }, indent=2)
 
+def _is_ok_status(result) -> bool:
+    """
+    True when the HTTP status code looks usable. crawl4ai sets result.success
+    even for error pages that contain HTML (e.g. 404 with a styled error
+    page), so we filter explicitly on status_code. None means "unknown",
+    which we accept to stay backwards compatible for transports that do not
+    surface the code (file://, local renders, etc.).
+    """
+    code = getattr(result, "status_code", None)
+    return code is None or code < 400
+
+
 async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[str, Any]]:
     """
     Crawl a .txt or markdown file.
@@ -2742,10 +2756,12 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
     crawl_config = CrawlerRunConfig()
 
     result = await crawler.arun(url=url, config=crawl_config)
-    if result.success and result.markdown:
+    if result.success and result.markdown and _is_ok_status(result):
         return [{'url': url, 'markdown': result.markdown}]
     else:
-        print(f"Failed to crawl {url}: {result.error_message}")
+        status = getattr(result, "status_code", None)
+        err = getattr(result, "error_message", None)
+        print(f"Failed to crawl {url}: status={status} error={err}")
         return []
 
 async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10) -> List[Dict[str, Any]]:
@@ -2768,7 +2784,15 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
     )
 
     results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
-    return [{'url': r.url, 'markdown': r.markdown, 'links': r.links} for r in results if r.success and r.markdown]
+    kept = []
+    for r in results:
+        if not (r.success and r.markdown):
+            continue
+        if not _is_ok_status(r):
+            print(f"Skipping {r.url}: HTTP {getattr(r, 'status_code', None)}")
+            continue
+        kept.append({'url': r.url, 'markdown': r.markdown, 'links': r.links})
+    return kept
 
 async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10) -> List[Dict[str, Any]]:
     """
@@ -2810,12 +2834,14 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
             norm_url = normalize_url(result.url)
             visited.add(norm_url)
 
-            if result.success and result.markdown:
+            if result.success and result.markdown and _is_ok_status(result):
                 results_all.append({'url': result.url, 'markdown': result.markdown})
                 for link in result.links.get("internal", []):
                     next_url = normalize_url(link["href"])
                     if next_url not in visited:
                         next_level_urls.add(next_url)
+            elif result.success and not _is_ok_status(result):
+                print(f"Skipping {result.url}: HTTP {getattr(result, 'status_code', None)}")
 
         current_urls = next_level_urls
 
