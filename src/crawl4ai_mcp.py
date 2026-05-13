@@ -288,10 +288,14 @@ async def _rerank_remote(query: str, results: List[Dict[str, Any]], content_key:
         indices = [int(x.strip()) - 1 for x in raw.split(",") if x.strip().isdigit()]
         valid = [i for i in indices if 0 <= i < len(results)]
         missing = [i for i in range(len(results)) if i not in valid]
-        return [results[i] for i in valid + missing]
+        reordered = [results[i] for i in valid + missing]
+        n = len(reordered)
+        for rank, r in enumerate(reordered):
+            r["rerank_score"] = (n - rank) / n if n else 0.0
+        return reordered
     except Exception as e:
         print(f"Error during remote reranking: {e}")
-        return results
+        raise
 
 
 async def rerank_results(query: str, results: List[Dict[str, Any]], content_key: str = "content", model: Any = None) -> List[Dict[str, Any]]:
@@ -1709,12 +1713,13 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
         processing_time = time.time() - query_start_time
         print(f"RAG query completed in {processing_time:.2f}s with {len(formatted_results)} results")
         
+        reranking_applied = use_reranking and any("rerank_score" in r for r in results)
         return json.dumps({
             "success": True,
             "query": query,
             "source_filter": source,
             "search_mode": "hybrid" if use_hybrid_search else "vector",
-            "reranking_applied": use_reranking,
+            "reranking_applied": reranking_applied,
             "results": formatted_results,
             "count": len(formatted_results),
             "processing_time_seconds": round(processing_time, 2)
@@ -1874,12 +1879,13 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
                 formatted_result["rerank_score"] = result["rerank_score"]
             formatted_results.append(formatted_result)
         
+        reranking_applied = use_reranking and any("rerank_score" in r for r in results)
         return json.dumps({
             "success": True,
             "query": query,
             "source_filter": source_id,
             "search_mode": "hybrid" if use_hybrid_search else "vector",
-            "reranking_applied": use_reranking,
+            "reranking_applied": reranking_applied,
             "results": formatted_results,
             "count": len(formatted_results)
         }, indent=2)
