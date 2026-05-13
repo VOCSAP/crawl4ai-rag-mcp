@@ -15,7 +15,7 @@ findings.md
 progress.md
 crawl4ai-rag-mcp-plan.md
 .planning/
-TEST_RESULTS.md
+tests/
 test_agentic.py
 CLAUDE.md
 KNOWN_ISSUES.md
