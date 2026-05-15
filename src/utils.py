@@ -1,13 +1,16 @@
 """
 Utility functions for the Crawl4AI MCP server.
 """
+import atexit
 import os
+import threading
 import concurrent.futures
 from typing import List, Dict, Any, Optional, Tuple
 import json
 from urllib.parse import urlparse
 import psycopg2
 import psycopg2.extras
+from psycopg2 import pool as _pg_pool
 import openai
 import re
 import time
@@ -23,14 +26,103 @@ def _get_openai_client() -> openai.OpenAI:
 
 
 
-def get_db_conn():
-    """
-    Return a new psycopg2 connection using DATABASE_URL from environment.
-    """
+# Module-level connection pool. Initialized lazily on first get_db_conn() call.
+# Each FastMCP SSE session opens a new lifespan, so without pooling every reconnect
+# from Claude Code would open a fresh psycopg2 connection and eventually exhaust
+# Postgres max_connections ("FATAL: sorry, too many clients already").
+_DB_POOL: Optional[_pg_pool.ThreadedConnectionPool] = None
+_DB_POOL_LOCK = threading.Lock()
+
+
+def _build_db_pool() -> _pg_pool.ThreadedConnectionPool:
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         raise ValueError("DATABASE_URL must be set in environment variables")
-    return psycopg2.connect(db_url)
+    minconn = int(os.getenv("POSTGRES_POOL_MIN", "1"))
+    maxconn = int(os.getenv("POSTGRES_POOL_MAX", "10"))
+    # Belt-and-braces: tell Postgres to drop sessions that sit idle in a
+    # transaction for too long, so a brutally killed client cannot pin a slot.
+    idle_tx_timeout_ms = int(os.getenv("POSTGRES_IDLE_TX_TIMEOUT_MS", "60000"))
+    options = f"-c idle_in_transaction_session_timeout={idle_tx_timeout_ms}"
+    return _pg_pool.ThreadedConnectionPool(
+        minconn=minconn,
+        maxconn=maxconn,
+        dsn=db_url,
+        options=options,
+    )
+
+
+def _get_pool() -> _pg_pool.ThreadedConnectionPool:
+    global _DB_POOL
+    if _DB_POOL is None:
+        with _DB_POOL_LOCK:
+            if _DB_POOL is None:
+                _DB_POOL = _build_db_pool()
+    return _DB_POOL
+
+
+def get_db_conn():
+    """
+    Borrow a psycopg2 connection from the module-level pool.
+
+    The caller MUST return the connection via release_db_conn() once done,
+    typically in the lifespan's finally clause. Closing it directly bypasses
+    the pool and leaks a slot.
+    """
+    conn = _get_pool().getconn()
+    # If a previous holder left the conn in a broken state (rollback needed,
+    # transaction aborted...), psycopg2 keeps it that way. Best-effort reset.
+    try:
+        if conn.closed:
+            # putconn(close=True) discards the dead conn; pool will create a fresh one next time.
+            _get_pool().putconn(conn, close=True)
+            return _get_pool().getconn()
+        if getattr(conn, "status", None) != psycopg2.extensions.STATUS_READY:
+            conn.rollback()
+    except Exception:
+        # Never let conn hygiene break the caller; just hand back the conn.
+        pass
+    return conn
+
+
+def release_db_conn(conn) -> None:
+    """
+    Return a connection previously obtained via get_db_conn() to the pool.
+    Safe to call with None or with a connection from a torn-down pool.
+    """
+    if conn is None:
+        return
+    pool = _DB_POOL
+    if pool is None:
+        # Pool was never initialized or already closed; just close the conn.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+    try:
+        # If the conn errored out, discard it so the pool replaces it.
+        close = bool(getattr(conn, "closed", 0))
+        pool.putconn(conn, close=close)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _shutdown_db_pool() -> None:
+    global _DB_POOL
+    pool = _DB_POOL
+    _DB_POOL = None
+    if pool is not None:
+        try:
+            pool.closeall()
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_db_pool)
 
 
 def create_embeddings_batch(texts: List[str]) -> List[List[float]]:

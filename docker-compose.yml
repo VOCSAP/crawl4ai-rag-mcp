@@ -4,6 +4,16 @@ services:
     image: pgvector/pgvector:pg16
     container_name: postgres-rag
     restart: unless-stopped
+    # Server-side guard-rails matching the client-side connection pool in src/utils.py:
+    #   - max_connections=200 leaves headroom while the pool caps itself at 10 by default.
+    #   - idle_in_transaction_session_timeout=60s reclaims slots from clients that
+    #     died mid-transaction (typical of an abruptly disconnected SSE session).
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "idle_in_transaction_session_timeout=60000"
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-rag}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rag}

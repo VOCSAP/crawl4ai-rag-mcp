@@ -37,6 +37,7 @@ sys.path.append(str(knowledge_graphs_path))
 
 from utils import (
     get_db_conn,
+    release_db_conn,
     add_documents_to_db,
     search_documents,
     extract_code_blocks,
@@ -162,9 +163,17 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     Yields:
         Crawl4AIContext: The context containing the Crawl4AI crawler and Supabase client
     """
-    # Initialize database connection (fast, no Chromium)
-    db_conn = get_db_conn()
-    
+    # Borrow a database connection from the pool (see utils.get_db_conn).
+    # MUST be returned via release_db_conn() in the finally block, otherwise
+    # an abrupt SSE client disconnect leaks a pool slot and eventually saturates
+    # Postgres max_connections.
+    db_conn = None
+    try:
+        db_conn = get_db_conn()
+    except Exception as e:
+        print(f"Failed to borrow Postgres connection: {e}")
+        raise
+
     # Initialize local reranking model if backend=local
     reranking_model = None
     if os.getenv("USE_RERANKING", "false") == "true" and os.getenv("RERANKING_BACKEND", "local") == "local":
@@ -222,10 +231,7 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
         yield ctx
     finally:
         await ctx.close_crawler()
-        try:
-            db_conn.close()
-        except Exception:
-            pass
+        release_db_conn(db_conn)
         if knowledge_validator:
             try:
                 await knowledge_validator.close()
