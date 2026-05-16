@@ -5,6 +5,7 @@ import atexit
 import os
 import threading
 import concurrent.futures
+from contextlib import contextmanager, nullcontext
 from typing import List, Dict, Any, Optional, Tuple
 import json
 from urllib.parse import urlparse
@@ -125,6 +126,33 @@ def _shutdown_db_pool() -> None:
 atexit.register(_shutdown_db_pool)
 
 
+@contextmanager
+def _pool_conn():
+    """
+    Borrow a connection from the pool for the duration of the with-block and
+    release it on exit, even if the caller is cancelled or raises. This is the
+    only safe way to use the pool from request-handling code: a leaked slot
+    here is unrecoverable until the process restarts.
+    """
+    conn = get_db_conn()
+    try:
+        yield conn
+    finally:
+        release_db_conn(conn)
+
+
+def _conn_or_pool(conn):
+    """
+    Return a context manager yielding `conn` if provided, else a freshly
+    borrowed pool connection. Lets each helper accept an optional pre-existing
+    connection (useful for tests or to share one across a group of statements)
+    while defaulting to per-call borrow.
+    """
+    if conn is not None:
+        return nullcontext(conn)
+    return _pool_conn()
+
+
 def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
     Create embeddings for multiple texts in a single API call.
@@ -227,18 +255,37 @@ def process_chunk_with_context(args):
 
 
 def add_documents_to_db(
+    urls: List[str],
+    chunk_numbers: List[int],
+    contents: List[str],
+    metadatas: List[Dict[str, Any]],
+    url_to_full_document: Dict[str, str],
+    batch_size: int = 20,
+    *,
+    conn=None,
+) -> None:
+    """
+    Add documents to the crawled_pages table in batches.
+    Deletes existing records with the same URLs before inserting.
+
+    A connection is borrowed from the pool for the duration of the call, then
+    returned. Pass `conn=` to reuse an externally-held connection (tests).
+    """
+    with _conn_or_pool(conn) as conn:
+        _add_documents_to_db_impl(
+            conn, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size
+        )
+
+
+def _add_documents_to_db_impl(
     conn,
     urls: List[str],
     chunk_numbers: List[int],
     contents: List[str],
     metadatas: List[Dict[str, Any]],
     url_to_full_document: Dict[str, str],
-    batch_size: int = 20
+    batch_size: int,
 ) -> None:
-    """
-    Add documents to the crawled_pages table in batches.
-    Deletes existing records with the same URLs before inserting.
-    """
     unique_urls = list(set(urls))
 
     try:
@@ -375,11 +422,12 @@ def add_documents_to_db(
 
 
 def search_documents(
-    conn,
     query: str,
     match_count: int = 10,
     filter_metadata: Optional[Dict[str, Any]] = None,
-    source_id_filter: Optional[str] = None
+    source_id_filter: Optional[str] = None,
+    *,
+    conn=None,
 ) -> List[Dict[str, Any]]:
     """
     Search for documents using vector similarity via match_crawled_pages stored function.
@@ -410,13 +458,14 @@ def search_documents(
         filter_json = json.dumps(filter_metadata) if filter_metadata else "{}"
         embedding_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
 
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT * FROM match_crawled_pages(%s::vector, %s, %s::jsonb, %s)",
-                (embedding_str, match_count * 3 if source_id_filter else match_count,
-                 filter_json, source_id_filter)
-            )
-            rows = cur.fetchall()
+        with _conn_or_pool(conn) as c:
+            with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM match_crawled_pages(%s::vector, %s, %s::jsonb, %s)",
+                    (embedding_str, match_count * 3 if source_id_filter else match_count,
+                     filter_json, source_id_filter)
+                )
+                rows = cur.fetchall()
 
         if timeout_event.is_set():
             raise TimeoutError("Vector search timed out")
@@ -555,20 +604,35 @@ Based on the code example and its surrounding context, provide a concise summary
 
 
 def add_code_examples_to_db(
-    conn,
     urls: List[str],
     chunk_numbers: List[int],
     code_examples: List[str],
     summaries: List[str],
     metadatas: List[Dict[str, Any]],
-    batch_size: int = 20
+    batch_size: int = 20,
+    *,
+    conn=None,
 ):
     """
     Add code examples to the code_examples table in batches.
     """
     if not urls:
         return
+    with _conn_or_pool(conn) as conn:
+        _add_code_examples_to_db_impl(
+            conn, urls, chunk_numbers, code_examples, summaries, metadatas, batch_size
+        )
 
+
+def _add_code_examples_to_db_impl(
+    conn,
+    urls: List[str],
+    chunk_numbers: List[int],
+    code_examples: List[str],
+    summaries: List[str],
+    metadatas: List[Dict[str, Any]],
+    batch_size: int,
+):
     unique_urls = list(set(urls))
     try:
         with conn.cursor() as cur:
@@ -675,28 +739,29 @@ def add_code_examples_to_db(
         print(f"Inserted batch {i//batch_size + 1} of {(total_items + batch_size - 1)//batch_size} code examples")
 
 
-def update_source_info(conn, source_id: str, summary: str, word_count: int):
+def update_source_info(source_id: str, summary: str, word_count: int, *, conn=None):
     """
     Upsert source information in the sources table.
     """
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO sources (source_id, summary, total_word_count)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (source_id) DO UPDATE
-                  SET summary = EXCLUDED.summary,
-                      total_word_count = EXCLUDED.total_word_count,
-                      updated_at = now()
-                """,
-                (source_id, summary, word_count)
-            )
-        conn.commit()
-        print(f"Upserted source: {source_id}")
-    except Exception as e:
-        conn.rollback()
-        print(f"Error updating source {source_id}: {e}")
+    with _conn_or_pool(conn) as c:
+        try:
+            with c.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO sources (source_id, summary, total_word_count)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (source_id) DO UPDATE
+                      SET summary = EXCLUDED.summary,
+                          total_word_count = EXCLUDED.total_word_count,
+                          updated_at = now()
+                    """,
+                    (source_id, summary, word_count)
+                )
+            c.commit()
+            print(f"Upserted source: {source_id}")
+        except Exception as e:
+            c.rollback()
+            print(f"Error updating source {source_id}: {e}")
 
 
 def extract_source_summary(source_id: str, content: str, max_length: int = 500) -> str:
@@ -744,11 +809,12 @@ The above content is from the documentation for '{source_id}'. Please provide a 
 
 
 def search_code_examples(
-    conn,
     query: str,
     match_count: int = 10,
     filter_metadata: Optional[Dict[str, Any]] = None,
-    source_id: Optional[str] = None
+    source_id: Optional[str] = None,
+    *,
+    conn=None,
 ) -> List[Dict[str, Any]]:
     """
     Search for code examples using vector similarity via match_code_examples stored function.
@@ -780,13 +846,14 @@ def search_code_examples(
         filter_json = json.dumps(filter_metadata) if filter_metadata else "{}"
         embedding_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
 
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT * FROM match_code_examples(%s::vector, %s, %s::jsonb, %s)",
-                (embedding_str, match_count * 3 if source_id else match_count,
-                 filter_json, source_id)
-            )
-            rows = cur.fetchall()
+        with _conn_or_pool(conn) as c:
+            with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM match_code_examples(%s::vector, %s, %s::jsonb, %s)",
+                    (embedding_str, match_count * 3 if source_id else match_count,
+                     filter_json, source_id)
+                )
+                rows = cur.fetchall()
 
         if timeout_event.is_set():
             raise TimeoutError("Code search timed out")
@@ -823,31 +890,33 @@ def search_code_examples(
 # Direct DB query helpers (replace inline supabase calls in crawl4ai_mcp.py)
 # ---------------------------------------------------------------------------
 
-def get_raw_content_by_url(conn, url: str) -> List[str]:
+def get_raw_content_by_url(url: str, *, conn=None) -> List[str]:
     """
     Return all content chunks for a given URL, ordered by chunk_number.
     """
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT content FROM crawled_pages WHERE url = %s ORDER BY chunk_number",
-                (url,)
-            )
-            rows = cur.fetchall()
+        with _conn_or_pool(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT content FROM crawled_pages WHERE url = %s ORDER BY chunk_number",
+                    (url,)
+                )
+                rows = cur.fetchall()
         return [r[0] for r in rows]
     except Exception as e:
         print(f"Error fetching content for URL {url}: {e}")
         return []
 
 
-def get_all_sources(conn) -> List[Dict[str, Any]]:
+def get_all_sources(*, conn=None) -> List[Dict[str, Any]]:
     """
     Return all sources ordered by source_id.
     """
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM sources ORDER BY source_id")
-            rows = cur.fetchall()
+        with _conn_or_pool(conn) as c:
+            with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM sources ORDER BY source_id")
+                rows = cur.fetchall()
         return [dict(r) for r in rows]
     except Exception as e:
         print(f"Error fetching sources: {e}")
@@ -855,37 +924,39 @@ def get_all_sources(conn) -> List[Dict[str, Any]]:
 
 
 def keyword_search_crawled_pages(
-    conn,
     query: str,
     source: Optional[str],
-    limit: int
+    limit: int,
+    *,
+    conn=None,
 ) -> List[Dict[str, Any]]:
     """
     Full-text keyword search on crawled_pages.content using ILIKE.
     """
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            if source:
-                cur.execute(
-                    """
-                    SELECT id, url, chunk_number, content, metadata, source_id
-                    FROM crawled_pages
-                    WHERE content ILIKE %s AND source_id = %s
-                    LIMIT %s
-                    """,
-                    (f"%{query}%", source, limit)
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT id, url, chunk_number, content, metadata, source_id
-                    FROM crawled_pages
-                    WHERE content ILIKE %s
-                    LIMIT %s
-                    """,
-                    (f"%{query}%", limit)
-                )
-            rows = cur.fetchall()
+        with _conn_or_pool(conn) as c:
+            with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                if source:
+                    cur.execute(
+                        """
+                        SELECT id, url, chunk_number, content, metadata, source_id
+                        FROM crawled_pages
+                        WHERE content ILIKE %s AND source_id = %s
+                        LIMIT %s
+                        """,
+                        (f"%{query}%", source, limit)
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id, url, chunk_number, content, metadata, source_id
+                        FROM crawled_pages
+                        WHERE content ILIKE %s
+                        LIMIT %s
+                        """,
+                        (f"%{query}%", limit)
+                    )
+                rows = cur.fetchall()
         return [dict(r) for r in rows]
     except Exception as e:
         print(f"Error in keyword search (crawled_pages): {e}")
@@ -893,37 +964,39 @@ def keyword_search_crawled_pages(
 
 
 def keyword_search_code_examples(
-    conn,
     query: str,
     source_id: Optional[str],
-    limit: int
+    limit: int,
+    *,
+    conn=None,
 ) -> List[Dict[str, Any]]:
     """
     Full-text keyword search on code_examples.content OR summary using ILIKE.
     """
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            if source_id:
-                cur.execute(
-                    """
-                    SELECT id, url, chunk_number, content, summary, metadata, source_id
-                    FROM code_examples
-                    WHERE (content ILIKE %s OR summary ILIKE %s) AND source_id = %s
-                    LIMIT %s
-                    """,
-                    (f"%{query}%", f"%{query}%", source_id, limit)
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT id, url, chunk_number, content, summary, metadata, source_id
-                    FROM code_examples
-                    WHERE content ILIKE %s OR summary ILIKE %s
-                    LIMIT %s
-                    """,
-                    (f"%{query}%", f"%{query}%", limit)
-                )
-            rows = cur.fetchall()
+        with _conn_or_pool(conn) as c:
+            with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                if source_id:
+                    cur.execute(
+                        """
+                        SELECT id, url, chunk_number, content, summary, metadata, source_id
+                        FROM code_examples
+                        WHERE (content ILIKE %s OR summary ILIKE %s) AND source_id = %s
+                        LIMIT %s
+                        """,
+                        (f"%{query}%", f"%{query}%", source_id, limit)
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id, url, chunk_number, content, summary, metadata, source_id
+                        FROM code_examples
+                        WHERE content ILIKE %s OR summary ILIKE %s
+                        LIMIT %s
+                        """,
+                        (f"%{query}%", f"%{query}%", limit)
+                    )
+                rows = cur.fetchall()
         return [dict(r) for r in rows]
     except Exception as e:
         print(f"Error in keyword search (code_examples): {e}")
