@@ -36,8 +36,6 @@ knowledge_graphs_path = Path(__file__).resolve().parent.parent / 'knowledge_grap
 sys.path.append(str(knowledge_graphs_path))
 
 from utils import (
-    get_db_conn,
-    release_db_conn,
     add_documents_to_db,
     search_documents,
     extract_code_blocks,
@@ -128,7 +126,6 @@ class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
     _crawler: Optional[AsyncWebCrawler] = None
     _crawler_lock: Optional[asyncio.Lock] = None
-    db_conn: Any = None
     reranking_model: Optional[Any] = None
     knowledge_validator: Optional[Any] = None
     repo_extractor: Optional[Any] = None
@@ -163,16 +160,11 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     Yields:
         Crawl4AIContext: The context containing the Crawl4AI crawler and Supabase client
     """
-    # Borrow a database connection from the pool (see utils.get_db_conn).
-    # MUST be returned via release_db_conn() in the finally block, otherwise
-    # an abrupt SSE client disconnect leaks a pool slot and eventually saturates
-    # Postgres max_connections.
-    db_conn = None
-    try:
-        db_conn = get_db_conn()
-    except Exception as e:
-        print(f"Failed to borrow Postgres connection: {e}")
-        raise
+    # Note: no Postgres connection is borrowed here. Each utils.* helper now
+    # borrows its own connection from the pool around its SQL statement and
+    # releases it on completion. Holding a pooled conn for the whole session
+    # was the cause of pool exhaustion on abrupt SSE disconnect, since the
+    # lifespan finally was bypassed by anyio TaskGroup cancellation.
 
     # Initialize local reranking model if backend=local
     reranking_model = None
@@ -221,7 +213,6 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
         print("Knowledge graph functionality disabled - set USE_KNOWLEDGE_GRAPH=true to enable")
     
     ctx = Crawl4AIContext(
-        db_conn=db_conn,
         reranking_model=reranking_model,
         knowledge_validator=knowledge_validator,
         repo_extractor=repo_extractor
@@ -231,7 +222,6 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
         yield ctx
     finally:
         await ctx.close_crawler()
-        release_db_conn(db_conn)
         if knowledge_validator:
             try:
                 await knowledge_validator.close()
@@ -593,11 +583,9 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
         
         if return_raw_markdown:
             # Raw markdown mode - just return scraped content without RAG
-            db_conn = ctx.request_context.lifespan_context.db_conn
-
             for url in valid_urls:
                 try:
-                    content_chunks = get_raw_content_by_url(db_conn, url)
+                    content_chunks = get_raw_content_by_url(url)
                     if content_chunks:
                         results_data[url] = '\n\n'.join(content_chunks)
                         processed_urls += 1
@@ -786,11 +774,10 @@ async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: 
         
         # Get context components
         crawler = await ctx.request_context.lifespan_context.get_crawler()
-        db_conn = ctx.request_context.lifespan_context.db_conn
 
         # Always use unified processing (handles both single and multiple URLs seamlessly)
         return await _process_multiple_urls(
-            crawler, db_conn, urls_to_process,
+            crawler, urls_to_process,
             max_concurrent, batch_size, start_time, return_raw_markdown
         )
             
@@ -806,7 +793,6 @@ async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: 
 
 async def _process_multiple_urls(
     crawler: AsyncWebCrawler,
-    db_conn: Any,
     urls: List[str],
     max_concurrent: int,
     batch_size: int,
@@ -815,19 +801,18 @@ async def _process_multiple_urls(
 ) -> str:
     """
     Process one or more URLs using batch crawling and enhanced error handling.
-    
+
     This function seamlessly handles both single URL and multiple URL scenarios,
     maintaining backward compatibility for single URL inputs while providing
     enhanced performance and error handling for all cases.
-    
+
     Args:
         crawler: AsyncWebCrawler instance
-        db_conn: Supabase client
         urls: List of URLs to process (can be single URL or multiple)
         max_concurrent: Maximum concurrent browser sessions
         batch_size: Batch size for database operations
         start_time: Start time for performance tracking
-        
+
     Returns:
         JSON string with crawl results (single URL format for 1 URL, multi format for multiple)
     """
@@ -992,12 +977,11 @@ async def _process_multiple_urls(
             
             for (source_id, _), summary in zip(source_summary_args, source_summaries):
                 word_count = source_word_counts.get(source_id, 0)
-                update_source_info(db_conn, source_id, summary, word_count)
-        
+                update_source_info(source_id, summary, word_count)
+
         # Add documentation chunks to Supabase in batches (if any)
         if all_contents:
             add_documents_to_db(
-                db_conn,
                 all_urls,
                 all_chunk_numbers,
                 all_contents,
@@ -1052,7 +1036,6 @@ async def _process_multiple_urls(
             # Add all code examples to Supabase
             if code_examples:
                 add_code_examples_to_db(
-                    db_conn,
                     code_urls,
                     code_chunk_numbers,
                     code_examples,
@@ -1172,12 +1155,11 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
     try:
         # Get the crawler from the context
         crawler = await ctx.request_context.lifespan_context.get_crawler()
-        db_conn = ctx.request_context.lifespan_context.db_conn
 
         # Determine the crawl strategy
         crawl_results = []
         crawl_type = None
-        
+
         if is_txt(url):
             # For text files, use simple crawl
             crawl_results = await crawl_markdown_file(crawler, url)
@@ -1282,11 +1264,11 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         
         for (source_id, _), summary in zip(source_summary_args, source_summaries):
             word_count = source_word_counts.get(source_id, 0)
-            update_source_info(db_conn, source_id, summary, word_count)
-        
+            update_source_info(source_id, summary, word_count)
+
         # Add documentation chunks to Supabase (AFTER sources exist)
         batch_size = 20
-        add_documents_to_db(db_conn, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
+        add_documents_to_db(urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
         
         # Extract and process code examples from all documents only if enabled
         code_examples = []
@@ -1337,7 +1319,6 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             # Add all code examples to Supabase
             if code_examples:
                 add_code_examples_to_db(
-                    db_conn,
                     code_urls,
                     code_chunk_numbers,
                     code_examples,
@@ -1457,8 +1438,7 @@ async def get_available_sources(ctx: Context) -> str:
         JSON string with the list of available sources and their details
     """
     try:
-        db_conn = ctx.request_context.lifespan_context.db_conn
-        rows = get_all_sources(db_conn)
+        rows = get_all_sources()
 
         sources = [
             {
@@ -1529,30 +1509,21 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                     "error": "Source filter too long (max 200 characters)"
                 }, indent=2)
         
-        # Get the Supabase client from the context
-        db_conn = ctx.request_context.lifespan_context.db_conn
-        
-        if not db_conn:
-            return json.dumps({
-                "success": False,
-                "error": "Database client not available"
-            }, indent=2)
-        
         # Check if hybrid search is enabled
         use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
-        
+
         # Prepare source filter if source is provided and not empty
         # The source parameter should be the source_id (domain) not full URL
         if source:
             print(f"[DEBUG] Using source filter: '{source}'")
-        
+
         results = []
-        
+
         if use_hybrid_search:
             print("[DEBUG] Using hybrid search mode")
             try:
                 # Hybrid search: combine vector and keyword search with timeout protection
-                
+
                 # 1. Get vector search results with timeout (15 seconds)
                 print("[DEBUG] Executing vector search...")
                 try:
@@ -1560,7 +1531,6 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                         asyncio.get_event_loop().run_in_executor(
                             None,
                             lambda: search_documents(
-                                conn=db_conn,
                                 query=query,
                                 match_count=match_count * 2,  # Get double to have room for filtering
                                 source_id_filter=source  # Use source_id_filter instead of filter_metadata
@@ -1575,7 +1545,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                 except Exception as e:
                     print(f"Vector search failed: {e}, falling back to keyword search only")
                     vector_results = []
-                
+
                 # 2. Get keyword search results with timeout (10 seconds)
                 print("Executing keyword search...")
                 try:
@@ -1583,7 +1553,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                         asyncio.get_event_loop().run_in_executor(
                             None,
                             lambda: keyword_search_crawled_pages(
-                                db_conn, query, source, match_count * 2
+                                query, source, match_count * 2
                             )
                         ),
                         timeout=10.0
@@ -1654,7 +1624,6 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                     asyncio.get_event_loop().run_in_executor(
                         None,
                         lambda: search_documents(
-                            conn=db_conn,
                             query=query,
                             match_count=match_count,
                             source_id_filter=source  # Use source_id_filter instead of filter_metadata
@@ -1770,12 +1739,9 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
         }, indent=2)
     
     try:
-        # Get the Supabase client from the context
-        db_conn = ctx.request_context.lifespan_context.db_conn
-        
         # Check if hybrid search is enabled
         use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
-        
+
         # Prepare source filter if provided and not empty. The vector search
         # is filtered through the dedicated `source_id` parameter of
         # `match_code_examples` rather than via `metadata @> filter`, because
@@ -1788,15 +1754,14 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
 
             # 1. Get vector search results (get more to account for filtering)
             vector_results = search_code_examples_util(
-                conn=db_conn,
                 query=query,
                 match_count=match_count * 2,
                 source_id=source_filter
             )
-            
+
             # 2. Get keyword search results using ILIKE on both content and summary
             keyword_results = keyword_search_code_examples(
-                db_conn, query,
+                query,
                 source_filter,
                 match_count * 2
             )
@@ -1846,7 +1811,6 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
         else:
             # Standard vector search only
             results = search_code_examples_util(
-                conn=db_conn,
                 query=query,
                 match_count=match_count,
                 source_id=source_filter
