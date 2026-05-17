@@ -2827,11 +2827,35 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
 
     return results_all
 
+START_TIME = time.time()
+
+
+async def _health(request):
+    """Lightweight readiness probe. No DB, no Chromium, no MCP session."""
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ok", "uptime_s": int(time.time() - START_TIME)})
+
+
 async def main():
     transport = os.getenv("TRANSPORT", "sse")
     if transport == 'sse':
-        # Run the MCP server with sse transport
-        await mcp.run_sse_async()
+        # Build the Starlette SSE app, append a /health route, then serve via
+        # uvicorn (mirrors FastMCP.run_sse_async config). /health is used by
+        # the Gateway nginx upstream check and Uptime Kuma without opening a
+        # permanent SSE stream.
+        import uvicorn
+        from starlette.routing import Route
+
+        sse_app = mcp.sse_app()
+        sse_app.routes.append(Route("/health", _health, methods=["GET"]))
+
+        config = uvicorn.Config(
+            sse_app,
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+        await uvicorn.Server(config).serve()
     else:
         # Run the MCP server with stdio transport
         await mcp.run_stdio_async()
