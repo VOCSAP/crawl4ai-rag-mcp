@@ -246,6 +246,45 @@ NEO4J_PASSWORD=your_neo4j_password
 
 **🔐 Production Setup**: For production, set `SEARXNG_HOSTNAME` to your domain and `SEARXNG_TLS` to your email for automatic HTTPS.
 
+### Embedding model and vector dimension
+
+The vector dimension is fixed at the schema level: `crawled_pages.sql` declares
+`embedding vector(N)` and the `match_*` SQL functions accept `query_embedding vector(N)`
+with the same `N`. The Python side reads `EMBEDDING_DIMENSIONS` from the env. **Both
+must match exactly**, otherwise INSERTs fail with a pgvector dimension mismatch.
+
+Defaults shipped in this repo:
+
+| Variable | Value | Notes |
+|---|---|---|
+| `EMBEDDING_MODEL` | `bge-m3` | 1024 dims, 8192 tokens native context, multilingual. |
+| `EMBEDDING_DIMENSIONS` | `1024` | Must match `vector(1024)` in `crawled_pages.sql`. |
+
+**Migrating to a different embedder (dimension change)** requires:
+
+1. Update `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` in `.env`.
+2. Edit `crawled_pages.sql` and replace every `vector(<old>)` with `vector(<new>)`
+   (four occurrences: two table columns, two function signatures).
+3. Recreate the Postgres volume so the init script is re-executed:
+   ```bash
+   docker compose down -v   # DESTRUCTIVE -- wipes all indexed pages
+   docker compose up -d --build
+   ```
+   `docker compose restart` is **not** enough: the init SQL is sticky to the volume,
+   and `restart` does not reload the `.env`. Without `down -v` the schema stays at the
+   old dimension while Python emits the new one, and every INSERT silently triggers
+   the zero-embedding fallback (rows indexed with `[0.0, ..., 0.0]` -- they will never
+   match any query).
+4. Re-crawl your sources via `scrape_urls` / `smart_crawl_url`.
+
+**Chunk size vs embedder context**: if your embedder has a small `n_ctx_train`
+(e.g. 2048 for `nomic-embed-text:v1.5`), lower `chunk_size` on `scrape_urls`
+/ `smart_crawl_url` to stay under that limit. A safe rule of thumb is
+`chunk_size ≈ 3 × n_ctx_train` characters (≈ 1 token per 3-4 chars). When a chunk
+exceeds the limit, the embedder returns HTTP 400 and the server falls back to a
+zero vector for that chunk; you will see `[WARN] zero-embedding fallback ...`
+in the container logs.
+
 ### RAG Strategy Options
 
 The Crawl4AI RAG MCP server supports four powerful RAG strategies that can be enabled independently:

@@ -16,7 +16,7 @@ import openai
 import re
 import time
 
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIMENSIONS", "768"))
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
 
 
 def _get_openai_client() -> openai.OpenAI:
@@ -188,9 +188,23 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
                         embeddings.append(individual_response.data[0].embedding)
                         successful_count += 1
                     except Exception as individual_error:
-                        print(f"Failed to create embedding for text {i}: {individual_error}")
+                        text_preview = (text[:120] + "...") if len(text) > 120 else text
+                        print(
+                            f"[WARN] zero-embedding fallback for text #{i} "
+                            f"(len={len(text)} chars, model={model}, dim={EMBEDDING_DIM}): "
+                            f"{individual_error} | preview={text_preview!r}",
+                            flush=True,
+                        )
                         embeddings.append([0.0] * EMBEDDING_DIM)
 
+                if successful_count < len(texts):
+                    print(
+                        f"[WARN] {len(texts) - successful_count}/{len(texts)} chunks indexed with "
+                        f"zero-embedding placeholder -- they will not match any RAG query. "
+                        f"Common cause: chunk exceeds model n_ctx_train (truncate via chunk_size "
+                        f"or switch embedder).",
+                        flush=True,
+                    )
                 print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
                 return embeddings
 
@@ -203,7 +217,11 @@ def create_embedding(text: str) -> List[float]:
         embeddings = create_embeddings_batch([text])
         return embeddings[0] if embeddings else [0.0] * EMBEDDING_DIM
     except Exception as e:
-        print(f"Error creating embedding: {e}")
+        print(
+            f"[WARN] zero-embedding fallback for single text (len={len(text)} chars, "
+            f"dim={EMBEDDING_DIM}): {e}",
+            flush=True,
+        )
         return [0.0] * EMBEDDING_DIM
 
 
