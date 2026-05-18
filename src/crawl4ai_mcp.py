@@ -555,12 +555,19 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
         
         print(f"Found {len(valid_urls)} valid URLs to process")
         
-        # Step 5: Content processing - use existing scrape_urls function
+        # Step 5: Content processing - use existing scrape_urls function.
+        # Propagate return_raw_markdown so the inner pipeline can skip RAG indexation
+        # (chunking + contextual LLM rewrite + embeddings + INSERT) when the caller
+        # asked for raw markdown only. Without this, raw_markdown callers pay the
+        # full indexation cost (5+ minutes on contextual-heavy local LLM setups)
+        # before any byte is returned.
         try:
-            # Use the existing scrape_urls function to scrape all URLs
-            scrape_result_str = await scrape_urls(ctx, valid_urls, max_concurrent, batch_size)
+            scrape_result_str = await scrape_urls(
+                ctx, valid_urls, max_concurrent, batch_size,
+                return_raw_markdown=return_raw_markdown,
+            )
             scrape_result = json.loads(scrape_result_str)
-            
+
             if not scrape_result.get("success", False):
                 return json.dumps({
                     "success": False,
@@ -568,7 +575,7 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
                     "searxng_results": valid_urls,
                     "error": f"Scraping failed: {scrape_result.get('error', 'Unknown error')}"
                 }, indent=2)
-            
+
         except Exception as e:
             return json.dumps({
                 "success": False,
@@ -576,23 +583,23 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
                 "searxng_results": valid_urls,
                 "error": f"Scraping error: {str(e)}"
             }, indent=2)
-        
+
         # Step 6: Results processing based on return_raw_markdown flag
         results_data = {}
         processed_urls = 0
-        
+
         if return_raw_markdown:
-            # Raw markdown mode - just return scraped content without RAG
+            # Raw markdown mode: use the markdown already returned in-memory by
+            # scrape_urls(return_raw_markdown=True). Reading from the DB here is
+            # wrong since the inner pipeline intentionally did not store anything.
+            raw_results = scrape_result.get("results", {}) or {}
             for url in valid_urls:
-                try:
-                    content_chunks = get_raw_content_by_url(url)
-                    if content_chunks:
-                        results_data[url] = '\n\n'.join(content_chunks)
-                        processed_urls += 1
-                    else:
-                        results_data[url] = "No content found"
-                except Exception as e:
-                    results_data[url] = f"Error retrieving content: {str(e)}"
+                md = raw_results.get(url)
+                if md and md != "No content retrieved":
+                    results_data[url] = md
+                    processed_urls += 1
+                else:
+                    results_data[url] = "No content found"
         
         else:
             # RAG mode - perform RAG query for each URL with parallel processing
