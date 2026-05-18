@@ -710,22 +710,25 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
         }, indent=2)
 
 @mcp.tool()
-async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: int = 10, batch_size: int = 20, return_raw_markdown: bool = False) -> str:
+async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: int = 10, batch_size: int = 20, return_raw_markdown: bool = False, chunk_size: int = 5000) -> str:
     """
-    Scrape **one or more URLs** and store their contents as embedding chunks in Supabase.
+    Scrape **one or more URLs** and store their contents as embedding chunks in Postgres.
     Optionally, use `return_raw_markdown=true` to return raw markdown content without storing.
-    
-    The content is scraped and stored in Supabase for later retrieval and querying via perform_rag_query tool, unless
+
+    The content is scraped and stored in Postgres for later retrieval and querying via perform_rag_query tool, unless
     `return_raw_markdown=True` is specified, in which case raw markdown is returned directly.
-    
+
     Args:
         url: URL to scrape, or list of URLs for batch processing
         max_concurrent: Maximum number of concurrent browser sessions for multi-URL mode (default: 10)
         batch_size: Size of batches for database operations (default: 20)
         return_raw_markdown: If True, skip database storage and return raw markdown content (default: False)
-    
+        chunk_size: Maximum size in characters per chunk before embedding (default: 5000).
+            Lower this if the embedding model's n_ctx_train is small (e.g. 2048 for
+            nomic-embed-text:v1.5 -- use chunk_size ~3000 to stay safely under the limit).
+
     Returns:
-        Summary of the scraping operation and storage in Supabase, or raw markdown content if requested
+        Summary of the scraping operation and storage in Postgres, or raw markdown content if requested
     """
     start_time = time.time()
     
@@ -778,7 +781,8 @@ async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: 
         # Always use unified processing (handles both single and multiple URLs seamlessly)
         return await _process_multiple_urls(
             crawler, urls_to_process,
-            max_concurrent, batch_size, start_time, return_raw_markdown
+            max_concurrent, batch_size, start_time, return_raw_markdown,
+            chunk_size=chunk_size,
         )
             
     except Exception as e:
@@ -797,7 +801,8 @@ async def _process_multiple_urls(
     max_concurrent: int,
     batch_size: int,
     start_time: float,
-    return_raw_markdown: bool = False
+    return_raw_markdown: bool = False,
+    chunk_size: int = 5000,
 ) -> str:
     """
     Process one or more URLs using batch crawling and enhanced error handling.
@@ -892,7 +897,7 @@ async def _process_multiple_urls(
                     source_id = parsed_url.netloc or parsed_url.path
                     
                     # Chunk the content
-                    chunks = smart_chunk_markdown(crawl_result['markdown'])
+                    chunks = smart_chunk_markdown(crawl_result['markdown'], chunk_size=chunk_size)
                     
                     # Store content for source summary generation
                     if source_id not in source_content_map:
