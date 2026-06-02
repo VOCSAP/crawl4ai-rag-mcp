@@ -19,3 +19,4 @@ tests/
 test_agentic.py
 CLAUDE.md
 KNOWN_ISSUES.md
+.kleos-space
