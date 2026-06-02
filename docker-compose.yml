@@ -47,9 +47,12 @@ services:
       # downloaded once, then reused across container recreations. Combined
       # with the in-process singleton (_get_local_reranker), this removes the
       # per-SSE-session reload that blocked scrape requests.
-      # Set HF_HUB_OFFLINE=1 ONLY after the first run has populated ./hf_cache,
-      # otherwise the initial model download is blocked and the load fails.
+      # HF_HUB_OFFLINE=1 is now safe because ./hf_cache is populated (model
+      # downloaded on the 2026-06-02 deploy). It cuts all HF network round-trips
+      # at load time. If the reranking model name changes, drop this flag for
+      # one run so the new model can be fetched into ./hf_cache, then re-add it.
       - HF_HOME=/app/hf_cache
+      - HF_HUB_OFFLINE=1
     env_file:
       - .env
     ports:
