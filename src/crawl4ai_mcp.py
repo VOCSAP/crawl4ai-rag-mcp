@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 import requests
 import asyncio
+import functools
 import json
 import os
 import re
@@ -149,6 +150,19 @@ class Crawl4AIContext:
             await self._crawler.__aexit__(None, None, None)
             self._crawler = None
 
+@functools.cache
+def _get_local_reranker(model_name: str) -> Any:
+    """Load a local CrossEncoder reranker once per process.
+
+    Memoized on model_name so the heavy (network-bound) load happens a single
+    time even though the FastMCP SSE lifespan is re-entered per SSE session
+    under mcp==1.7.1. See KNOWN_ISSUES.md section IV.
+    """
+    from sentence_transformers import CrossEncoder
+    model = CrossEncoder(model_name)
+    print(f"Reranking model loaded (local CrossEncoder: {model_name})")
+    return model
+
 @asynccontextmanager
 async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     """
@@ -166,14 +180,18 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     # was the cause of pool exhaustion on abrupt SSE disconnect, since the
     # lifespan finally was bypassed by anyio TaskGroup cancellation.
 
-    # Initialize local reranking model if backend=local
+    # Initialize local reranking model if backend=local.
+    # The model is loaded through a process-level memoized singleton
+    # (_get_local_reranker) rather than inline here, because under mcp==1.7.1
+    # the SSE transport re-enters this lifespan on every SSE session. Loading
+    # the CrossEncoder inline would re-download/reload it (~5s, network-bound
+    # on HuggingFace) on each connection, blocking the handshake. The cache
+    # makes the load happen once per process regardless of lifespan re-entry.
     reranking_model = None
     if os.getenv("USE_RERANKING", "false") == "true" and os.getenv("RERANKING_BACKEND", "local") == "local":
         try:
-            from sentence_transformers import CrossEncoder
             local_model_name = os.getenv("RERANKING_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-            reranking_model = CrossEncoder(local_model_name)
-            print(f"Reranking model loaded (local CrossEncoder: {local_model_name})")
+            reranking_model = _get_local_reranker(local_model_name)
         except Exception as e:
             print(f"Failed to load local reranking model: {e}")
 

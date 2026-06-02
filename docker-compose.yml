@@ -43,6 +43,13 @@ services:
       - HOST=${HOST:-0.0.0.0}
       - PORT=${PORT:-8051}
       - SEARXNG_URL=${SEARXNG_URL:-http://searxng:8080}
+      # Persist the HuggingFace cache so the local CrossEncoder reranker is
+      # downloaded once, then reused across container recreations. Combined
+      # with the in-process singleton (_get_local_reranker), this removes the
+      # per-SSE-session reload that blocked scrape requests.
+      # Set HF_HUB_OFFLINE=1 ONLY after the first run has populated ./hf_cache,
+      # otherwise the initial model download is blocked and the load fails.
+      - HF_HOME=/app/hf_cache
     env_file:
       - .env
     ports:
@@ -55,6 +62,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./hf_cache:/app/hf_cache
     logging:
       driver: "json-file"
       options:
