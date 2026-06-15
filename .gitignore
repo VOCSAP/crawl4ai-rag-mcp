@@ -9,6 +9,11 @@ test_script_hallucination*
 # Graphify output cache
 graphify-out/
 
+# HuggingFace reranker cache: never version it (the model is baked into the
+# Docker image at build time). A committed cache once caused a git pull to
+# delete the host cache and break offline rerank.
+hf_cache/
+
 # Planning and session-local files (not part of the public repo)
 task_plan.md
 findings.md
