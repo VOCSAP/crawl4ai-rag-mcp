@@ -43,14 +43,12 @@ services:
       - HOST=${HOST:-0.0.0.0}
       - PORT=${PORT:-8051}
       - SEARXNG_URL=${SEARXNG_URL:-http://searxng:8080}
-      # Persist the HuggingFace cache so the local CrossEncoder reranker is
-      # downloaded once, then reused across container recreations. Combined
-      # with the in-process singleton (_get_local_reranker), this removes the
-      # per-SSE-session reload that blocked scrape requests.
-      # HF_HUB_OFFLINE=1 is now safe because ./hf_cache is populated (model
-      # downloaded on the 2026-06-02 deploy). It cuts all HF network round-trips
-      # at load time. If the reranking model name changes, drop this flag for
-      # one run so the new model can be fetched into ./hf_cache, then re-add it.
+      # The local CrossEncoder reranker model is baked into the image at build
+      # time (see Dockerfile), so HF_HUB_OFFLINE=1 cuts all HF network round-trips
+      # at load time without any host-side cache. Combined with the in-process
+      # singleton (_get_local_reranker), the model loads once per process.
+      # If RERANKING_MODEL changes, rebuild with a matching
+      # --build-arg RERANKING_MODEL=... (the baked model is build-time fixed).
       - HF_HOME=/app/hf_cache
       - HF_HUB_OFFLINE=1
     env_file:
@@ -65,7 +63,9 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./hf_cache:/app/hf_cache
+      # No hf_cache bind mount: the reranker model is baked into the image at
+      # build time (see Dockerfile). A host bind mount here would shadow the
+      # baked /app/hf_cache with an empty dir and break offline rerank.
     logging:
       driver: "json-file"
       options:

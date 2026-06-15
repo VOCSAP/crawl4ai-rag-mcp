@@ -38,6 +38,15 @@ RUN uv pip install --system torch --index-url https://download.pytorch.org/whl/c
 RUN uv pip install --system -e . && \
     crawl4ai-setup
 
+# Bake the local reranker CrossEncoder model into the image so HF_HUB_OFFLINE=1
+# works at runtime with no host-side cache. This survives `--build`, `down`,
+# and `git pull` (the model is part of the image artifact, not a bind mount).
+# Changing the runtime RERANKING_MODEL requires a rebuild with a matching
+# --build-arg RERANKING_MODEL=...
+ENV HF_HOME=/app/hf_cache
+ARG RERANKING_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('${RERANKING_MODEL}')"
+
 EXPOSE ${PORT}
 
 # Command to run the MCP server
