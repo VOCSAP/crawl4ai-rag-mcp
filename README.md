@@ -192,7 +192,7 @@ Configure the Docker stack by editing your `.env` file (copy from `.env.example`
 # ========================================
 # MCP SERVER CONFIGURATION
 # ========================================
-TRANSPORT=sse
+TRANSPORT=streamable-http
 HOST=0.0.0.0
 PORT=8051
 
@@ -423,15 +423,17 @@ After starting the Docker stack with `docker compose up -d`, your MCP server wil
 
 ### SSE Configuration (Recommended)
 
-The Docker stack runs with SSE transport by default. Connect using:
+The Docker stack runs with Streamable HTTP transport by default (the SSE
+transport is deprecated upstream). The MCP endpoint is served at `/mcp`.
+Connect using:
 
 **Claude Desktop/Windsurf:**
 ```json
 {
   "mcpServers": {
     "crawl4ai-rag": {
-      "transport": "sse",
-      "url": "http://localhost:8051/sse"
+      "transport": "http",
+      "url": "http://localhost:8051/mcp"
     }
   }
 }
@@ -442,8 +444,8 @@ The Docker stack runs with SSE transport by default. Connect using:
 {
   "mcpServers": {
     "crawl4ai-rag": {
-      "transport": "sse",
-      "serverUrl": "http://localhost:8051/sse"
+      "transport": "http",
+      "serverUrl": "http://localhost:8051/mcp"
     }
   }
 }
@@ -451,13 +453,16 @@ The Docker stack runs with SSE transport by default. Connect using:
 
 **Claude Code CLI:**
 ```bash
-claude mcp add-json crawl4ai-rag '{"type":"http","url":"http://localhost:8051/sse"}' --scope user
+claude mcp add-json crawl4ai-rag '{"type":"http","url":"http://localhost:8051/mcp"}' --scope user
 ```
+
+> Legacy SSE is still available via `TRANSPORT=sse` (endpoint `/sse`) for older
+> clients, but is best-effort and no longer the default.
 
 ### Docker Networking Notes
 
-- **Same machine**: Use `http://localhost:8051/sse`
-- **Different container**: Use `http://host.docker.internal:8051/sse`
+- **Same machine**: Use `http://localhost:8051/mcp`
+- **Different container**: Use `http://host.docker.internal:8051/mcp`
 - **Remote access**: Replace `localhost` with your server's IP address
 
 ### Production Deployment
@@ -472,7 +477,7 @@ For production use with custom domains:
 
 2. **Access via HTTPS**:
    ```
-   https://yourdomain.com:8051/sse
+   https://yourdomain.com:8051/mcp
    ```
 
 ### Health Check
