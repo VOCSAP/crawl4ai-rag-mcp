@@ -5,10 +5,6 @@ This server provides tools to crawl websites using Crawl4AI, automatically detec
 the appropriate crawl method based on URL type (sitemap, txt file, or regular webpage).
 Also includes AI hallucination detection and repository parsing tools using Neo4j knowledge graphs.
 """
-# Apply ServerSession init-race workaround BEFORE FastMCP creates any session.
-# See src/mcp_init_patch.py and KNOWN_ISSUES.md section I.
-import mcp_init_patch  # noqa: F401
-
 from mcp.server.fastmcp import FastMCP, Context
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
@@ -155,8 +151,8 @@ def _get_local_reranker(model_name: str) -> Any:
     """Load a local CrossEncoder reranker once per process.
 
     Memoized on model_name so the heavy (network-bound) load happens a single
-    time even though the FastMCP SSE lifespan is re-entered per SSE session
-    under mcp==1.7.1. See KNOWN_ISSUES.md section IV.
+    time even though crawl4ai_lifespan is re-entered per MCP session
+    (Streamable HTTP stateful). See KNOWN_ISSUES.md section IV.
     """
     from sentence_transformers import CrossEncoder
     model = CrossEncoder(model_name)
@@ -182,11 +178,11 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
 
     # Initialize local reranking model if backend=local.
     # The model is loaded through a process-level memoized singleton
-    # (_get_local_reranker) rather than inline here, because under mcp==1.7.1
-    # the SSE transport re-enters this lifespan on every SSE session. Loading
-    # the CrossEncoder inline would re-download/reload it (~5s, network-bound
-    # on HuggingFace) on each connection, blocking the handshake. The cache
-    # makes the load happen once per process regardless of lifespan re-entry.
+    # (_get_local_reranker) rather than inline here, because this lifespan is
+    # re-entered once per MCP session (Streamable HTTP stateful) -- and per
+    # request under stateless mode. Loading the CrossEncoder inline would
+    # re-download/reload it (~5s, network-bound on HuggingFace) on each
+    # re-entry. The cache makes the load happen once per process regardless.
     reranking_model = None
     if os.getenv("USE_RERANKING", "false") == "true" and os.getenv("RERANKING_BACKEND", "local") == "local":
         try:
@@ -253,13 +249,25 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
             except Exception as e:
                 print(f"Error closing repository extractor: {e}")
 
-# Initialize FastMCP server
+# Initialize FastMCP server.
+#
+# Transport: Streamable HTTP (the SSE transport is deprecated upstream since the
+# MCP spec revision of 2025-03). The Streamable HTTP endpoint is served at
+# `streamable_http_path` (default "/mcp").
+#
+# stateless_http=False (stateful) is deliberate: in stateless mode the SDK runs
+# the low-level server -- and therefore crawl4ai_lifespan -- once per HTTP
+# request, whose `finally` would tear down the warm Chromium crawler on every
+# tool call. Stateful mode runs the lifespan once per MCP session (Mcp-Session-Id
+# reused by the client), keeping Chromium warm for the session lifetime.
 mcp = FastMCP(
     "mcp-crawl4ai-rag",
     description="MCP server for RAG and web crawling with Crawl4AI",
     lifespan=crawl4ai_lifespan,
     host=os.getenv("HOST", "0.0.0.0"),
-    port=os.getenv("PORT", "8051")
+    port=int(os.getenv("PORT", "8051")),
+    streamable_http_path=os.getenv("STREAMABLE_HTTP_PATH", "/mcp"),
+    stateless_http=False,
 )
 
 async def _rerank_local(model: Any, query: str, results: List[Dict[str, Any]], content_key: str) -> List[Dict[str, Any]]:
@@ -2860,34 +2868,34 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
 START_TIME = time.time()
 
 
+@mcp.custom_route("/health", methods=["GET"])
 async def _health(request):
-    """Lightweight readiness probe. No DB, no Chromium, no MCP session."""
+    """Lightweight readiness probe. No DB, no Chromium, no MCP session.
+
+    Registered as a FastMCP custom route, so it is included in both the
+    Streamable HTTP app and the (legacy) SSE app, and stays public (no auth).
+    Used by the Gateway nginx upstream check and Uptime Kuma without opening a
+    permanent stream.
+    """
     from starlette.responses import JSONResponse
     return JSONResponse({"status": "ok", "uptime_s": int(time.time() - START_TIME)})
 
 
 async def main():
-    transport = os.getenv("TRANSPORT", "sse")
-    if transport == 'sse':
-        # Build the Starlette SSE app, append a /health route, then serve via
-        # uvicorn (mirrors FastMCP.run_sse_async config). /health is used by
-        # the Gateway nginx upstream check and Uptime Kuma without opening a
-        # permanent SSE stream.
-        import uvicorn
-        from starlette.routing import Route
-
-        sse_app = mcp.sse_app()
-        sse_app.routes.append(Route("/health", _health, methods=["GET"]))
-
-        config = uvicorn.Config(
-            sse_app,
-            host=mcp.settings.host,
-            port=mcp.settings.port,
-            log_level=mcp.settings.log_level.lower(),
-        )
-        await uvicorn.Server(config).serve()
+    # Default transport is Streamable HTTP (SSE is deprecated upstream).
+    transport = os.getenv("TRANSPORT", "streamable-http")
+    if transport == 'streamable-http':
+        # Serves the MCP endpoint at streamable_http_path ("/mcp") plus the
+        # /health custom route. run_streamable_http_async builds the Starlette
+        # app (session-manager lifespan included) and serves it via uvicorn.
+        await mcp.run_streamable_http_async()
+    elif transport == 'sse':
+        # Legacy fallback for older clients. Best-effort: the SSE init-race
+        # monkey-patch was removed with the SDK upgrade, so the Claude Code
+        # init race may resurface here. Prefer streamable-http.
+        await mcp.run_sse_async()
     else:
-        # Run the MCP server with stdio transport
+        # Run the MCP server with stdio transport.
         await mcp.run_stdio_async()
 
 if __name__ == "__main__":
