@@ -326,6 +326,7 @@ Applies cross-encoder reranking to search results after initial retrieval. Uses 
 - **Trade-offs**: Adds ~100-200ms to search queries depending on result count, but significantly improves result ordering.
 - **Cost**: No additional API costs - uses a local model that runs on CPU.
 - **Benefits**: Better result relevance, especially for complex queries. Works with both regular RAG search and code example search.
+- **Backends** (`RERANKING_BACKEND`): `local` (default, in-process CPU CrossEncoder), `remote` (Ollama LLM, RankGPT-style listwise), or `http` (external HuggingFace TEI `/rerank` cross-encoder such as `bge-reranker-v2-m3`). The `http` backend offloads scoring to a shared LAN server via `RERANKING_HTTP_URL` and keeps no reranking model in the server process.
 
 #### 5. **USE_KNOWLEDGE_GRAPH**
 Enables AI hallucination detection and repository analysis using Neo4j knowledge graphs. When enabled, the system can parse GitHub repositories into a graph database and validate AI-generated code against real repository structures. **Fully compatible with Docker** - all functionality works within the containerized environment.
