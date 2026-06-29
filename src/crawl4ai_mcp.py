@@ -22,6 +22,7 @@ import os
 import re
 
 import openai
+import httpx
 import concurrent.futures
 import sys
 import time
@@ -320,13 +321,49 @@ async def _rerank_remote(query: str, results: List[Dict[str, Any]], content_key:
         raise
 
 
+async def _rerank_http(query: str, results: List[Dict[str, Any]], content_key: str) -> List[Dict[str, Any]]:
+    """Remote cross-encoder reranking via a HuggingFace TEI /rerank endpoint.
+
+    The model is fixed server-side (RERANKING_MODEL is ignored in this mode). The
+    server runs with --auto-truncate, so the full chunk text is sent as-is; no
+    client-side truncation is applied. The real sigmoid score (raw_scores=false)
+    is posted onto each returned document, mirroring _rerank_local's contract.
+    """
+    url = os.getenv("RERANKING_HTTP_URL")
+    if not url:
+        raise ValueError("RERANKING_BACKEND=http requires RERANKING_HTTP_URL")
+    timeout = float(os.getenv("RERANKING_TIMEOUT", "60"))
+    texts = [r.get(content_key, "") for r in results]
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json={"query": query, "texts": texts, "raw_scores": False})
+        resp.raise_for_status()
+        ranking = resp.json()  # [{"index": int, "score": float}, ...] sorted desc
+
+    reordered: List[Dict[str, Any]] = []
+    seen = set()
+    for item in ranking:
+        i = item.get("index")
+        if isinstance(i, int) and 0 <= i < len(results) and i not in seen:
+            results[i]["rerank_score"] = float(item.get("score", 0.0))
+            reordered.append(results[i])
+            seen.add(i)
+    # Safety net: append any document the server did not return, original order.
+    for i, r in enumerate(results):
+        if i not in seen:
+            reordered.append(r)
+    return reordered
+
+
 async def rerank_results(query: str, results: List[Dict[str, Any]], content_key: str = "content", model: Any = None) -> List[Dict[str, Any]]:
-    """Dispatch to local CrossEncoder or remote LLM reranking based on RERANKING_BACKEND."""
+    """Dispatch to local CrossEncoder, remote LLM, or HTTP TEI reranking based on RERANKING_BACKEND."""
     if not results:
         return results
     backend = os.getenv("RERANKING_BACKEND", "local")
     if backend == "local" and model is not None:
         return await _rerank_local(model, query, results, content_key)
+    if backend == "http":
+        return await _rerank_http(query, results, content_key)
     return await _rerank_remote(query, results, content_key)
 
 def is_sitemap(url: str) -> bool:
