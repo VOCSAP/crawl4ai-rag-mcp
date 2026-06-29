@@ -41,6 +41,7 @@ services:
       - HOST=${HOST:-0.0.0.0}
       - PORT=${PORT:-8051}
       - SEARXNG_URL=${SEARXNG_URL:-http://searxng:8080}
+      - TZ=${TZ:-America/Sao_Paulo}
       # The local CrossEncoder reranker model is baked into the image at build
       # time (see Dockerfile), so HF_HUB_OFFLINE=1 cuts all HF network round-trips
       # at load time without any host-side cache. Combined with the in-process
@@ -133,6 +134,7 @@ services:
       - searxng-data:/var/cache/searxng:rw
     environment:
       - SEARXNG_BASE_URL=https://searxng.home.coreleap.com.br/
+      - TZ=${TZ:-America/Sao_Paulo}
     cap_drop:
       - ALL
     cap_add:
