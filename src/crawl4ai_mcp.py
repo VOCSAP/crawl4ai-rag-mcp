@@ -2197,8 +2197,9 @@ async def execute_js(ctx: Context, url: str, scripts: Union[str, List[str]]) -> 
     """
     Execute one or more JavaScript snippets on a page and return the crawl result.
 
-    Each snippet should be an expression (or IIFE / async function) that returns a value.
-    Snippets run in order in the page context.
+    Each snippet runs as the body of an async function, so use `return <value>;` to
+    surface a value (crawl4ai 0.9.0 convention). A bare expression runs but its value
+    is discarded. Snippets run in order in the page context.
 
     Args:
         url: The page URL to load
