@@ -4,7 +4,7 @@
 
 > **(FORKED FROM https://github.com/coleam00/mcp-crawl4ai-rag). Added SearXNG integration and batch scrape and processing capabilities.**
 
-A **self-contained Docker solution** that combines the [Model Context Protocol (MCP)](https://modelcontextprotocol.io), [Crawl4AI](https://crawl4ai.com), [SearXNG](https://github.com/searxng/searxng), and [Supabase](https://supabase.com/) to provide AI agents and coding assistants with complete web **search, crawling, and RAG capabilities**.
+A **self-contained Docker solution** that combines the [Model Context Protocol (MCP)](https://modelcontextprotocol.io), [Crawl4AI](https://crawl4ai.com) (v0.9.0), [SearXNG](https://github.com/searxng/searxng), and a bundled **Postgres + pgvector** vector store to provide AI agents and coding assistants with complete web **search, crawling, and RAG capabilities**. This fork runs 100% locally: embeddings and LLM calls target an OpenAI-compatible endpoint (default: a local [Ollama](https://ollama.com/) instance), with no external cloud service required.
 
 **🚀 Complete Stack in One Command**: Deploy everything with `docker compose up -d` - no Python setup, no dependencies, no external services required.
 
@@ -78,12 +78,28 @@ The server provides essential web crawling and search tools:
 8. **`check_ai_script_hallucinations`**: Analyze Python scripts for AI hallucinations by validating imports, method calls, and class usage against the knowledge graph
 9. **`query_knowledge_graph`**: Explore and query the Neo4j knowledge graph with commands like `repos`, `classes`, `methods`, and custom Cypher queries
 
+### Web Search Tools (SearXNG)
+
+10. **`searxng_search`**: Meta-search the web via the integrated SearXNG instance (titles, URLs, snippets). No scraping or storage.
+11. **`searxng_images`**: Image search via SearXNG.
+12. **`searxng_news`**: News search via SearXNG.
+
+### Browser & Extraction Tools (mirror of the native crawl4ai MCP)
+
+13. **`capture_screenshot`**: Full-page PNG screenshot of a URL, returned as base64.
+14. **`generate_pdf`**: Render a URL to PDF, returned as base64.
+15. **`execute_js`**: Run one or more JavaScript snippets on a page and return the crawl result. Each snippet runs as an async function body, so use `return <value>;` to surface a value (crawl4ai 0.9.0 convention).
+16. **`get_markdown`**: Convert a URL to Markdown with a selectable content filter: `fit` (readability pruning, default), `raw` (full DOM), or `bm25` (relevance filtering against a query).
+17. **`generate_schema_html`**: Return sanitized, schema-ready HTML for building CSS/XPath extraction schemas.
+18. **`extract_structured`**: Crawl a URL to Markdown, then extract structured JSON with the configured LLM (Ollama via `OLLAMA_BASE_URL` / `MODEL_CHOICE`). Uses the OpenAI-compatible client directly, not crawl4ai's `LLMExtractionStrategy`.
+
 ## Prerequisites
 
 **Required:**
 - [Docker and Docker Compose](https://www.docker.com/products/docker-desktop/) - This is a Docker-only solution
-- [Supabase account](https://supabase.com/) - For vector database and RAG functionality
-- [OpenAI API key](https://platform.openai.com/api-keys) - For generating embeddings
+- An OpenAI-compatible embeddings/LLM endpoint - This fork targets a local [Ollama](https://ollama.com/) instance via `OLLAMA_BASE_URL` (default embedding model `bge-m3`). Any OpenAI-compatible endpoint works.
+
+The vector database (Postgres + pgvector) is bundled in the Docker Compose stack, so no external database account is required.
 
 **Optional:**
 - [Neo4j instance](https://neo4j.com/) - For knowledge graph functionality (see [Knowledge Graph Setup](#knowledge-graph-setup))
@@ -97,8 +113,8 @@ This is a **Docker-only solution** - no Python environment setup required!
 
 1. **Clone this repository:**
    ```bash
-   git clone https://github.com/coleam00/mcp-crawl4ai-rag.git
-   cd mcp-crawl4ai-rag
+   git clone https://github.com/VOCSAP/crawl4ai-rag-mcp.git
+   cd crawl4ai-rag-mcp
    ```
 
 2. **Configure environment:**
@@ -121,19 +137,21 @@ That's it! Your complete search, crawl, and RAG stack is now running:
 
 The Docker Compose stack includes:
 - **MCP Crawl4AI Server** - Main application server
+- **Postgres + pgvector** - Local vector database, auto-initialized from `crawled_pages.sql`
 - **SearXNG** - Private search engine instance
 - **Valkey** - Redis-compatible cache for SearXNG
 - **Caddy** - Reverse proxy with automatic HTTPS
 
-## Database Setup *IMPORTANT!*
+## Database Setup
 
-Before running the server, you need to set up the database with the pgvector extension:
+The database (Postgres + pgvector) is bundled in the Docker Compose stack and initializes itself automatically: `crawled_pages.sql` is mounted into `/docker-entrypoint-initdb.d/` and runs on the first `docker compose up`, creating the tables and the `match_crawled_pages` / `match_code_examples` functions.
 
-1. Go to the SQL Editor in your Supabase dashboard (create a new project first if necessary)
+To re-apply the schema after editing `crawled_pages.sql` (for example after a vector dimension change), recreate the volume:
 
-2. Create a new query and paste the contents of `crawled_pages.sql`
-
-3. Run the query to create the necessary tables and functions
+```bash
+docker compose down -v   # DESTRUCTIVE -- wipes all indexed pages
+docker compose up -d --build
+```
 
 ## Knowledge Graph Setup (Optional)
 
@@ -210,17 +228,25 @@ SEARXNG_HOSTNAME=http://localhost
 # SEARXNG_TLS=your-email@example.com  # For Let's Encrypt
 
 # ========================================
-# AI SERVICES CONFIGURATION
+# AI SERVICES CONFIGURATION (OpenAI-compatible, e.g. Ollama)
 # ========================================
-# Required: OpenAI API for embeddings
-OPENAI_API_KEY=your_openai_api_key
+# Embeddings + LLM endpoint (OpenAI-compatible). This fork targets Ollama.
+# Use host.docker.internal:11434 for Docker Desktop on Windows/Mac.
+OLLAMA_BASE_URL=http://host.docker.internal:11434
+# Dummy value for Ollama, or a real key / LiteLLM master key
+OPENAI_API_KEY=ollama
 
-# LLM for summaries and contextual embeddings
-MODEL_CHOICE=gpt-4.1-nano-2025-04-14
+# Embedding model and dimension (must match vector(N) in crawled_pages.sql)
+EMBEDDING_MODEL=bge-m3
+EMBEDDING_DIMENSIONS=1024
 
-# Required: Supabase for vector database
-SUPABASE_URL=your_supabase_project_url
-SUPABASE_SERVICE_KEY=your_supabase_service_key
+# LLM for summaries, contextual embeddings and extract_structured (empty = disabled)
+MODEL_CHOICE=
+
+# ========================================
+# VECTOR DATABASE (bundled Postgres + pgvector)
+# ========================================
+DATABASE_URL=postgresql://rag:rag@postgres:5432/ragdb
 
 # ========================================
 # RAG ENHANCEMENT STRATEGIES
@@ -568,11 +594,11 @@ ports:
 - Check for special characters that need quoting
 
 **API connection failures:**
-- Verify `OPENAI_API_KEY` is valid and has credits
-- Check `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` are correct
-- Test API connectivity from within container:
+- Verify `OLLAMA_BASE_URL` points to a reachable OpenAI-compatible endpoint
+- Check `DATABASE_URL` matches the bundled Postgres service (default `postgresql://rag:rag@postgres:5432/ragdb`)
+- Test the LLM endpoint from within the container:
   ```bash
-  docker compose exec mcp-crawl4ai curl -H "Authorization: Bearer $OPENAI_API_KEY" https://api.openai.com/v1/models
+  docker compose exec mcp-crawl4ai curl "$OLLAMA_BASE_URL/v1/models"
   ```
 
 **Neo4j connection issues:**
