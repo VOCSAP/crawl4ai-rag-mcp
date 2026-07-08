@@ -2383,16 +2383,28 @@ async def extract_structured(ctx: Context, url: str, instruction: str,
         )
 
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434") + "/v1"
-        timeout = float(os.getenv("LLM_TIMEOUT", "60"))
+        # Keep this below the MCP client idle timeout (~300s) so the tool always
+        # returns an error payload instead of hanging the transport.
+        timeout = float(os.getenv("LLM_TIMEOUT", "120"))
         client = openai.AsyncOpenAI(base_url=base_url,
                                     api_key=os.getenv("OPENAI_API_KEY", "ollama"),
                                     timeout=timeout)
-        response = await client.chat.completions.create(
-            model=model_choice,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            extra_body={"think": False},
-        )
+        # asyncio.wait_for bounds TOTAL generation time; the httpx-level timeout
+        # alone does not reliably cap a slow Ollama backend.
+        try:
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model_choice,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    extra_body={"think": False},
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            return json.dumps({"success": False, "url": url,
+                               "error": f"LLM extraction timed out after {timeout:.0f}s (model={model_choice}); "
+                                        "use a faster MODEL_CHOICE, lower EXTRACT_MAX_CHARS, or raise LLM_TIMEOUT"}, indent=2)
         raw = response.choices[0].message.content or ""
         cleaned = _strip_json_fences(raw)
         try:
