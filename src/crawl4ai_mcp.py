@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 import requests
 import asyncio
+import base64
 import functools
 import json
 import os
@@ -2106,6 +2107,303 @@ async def searxng_news(ctx: Context, query: str, engines: str = None,
         "results": results,
         "count": len(results),
     }, indent=2)
+
+
+def _crawl_error_payload(url: str, result) -> Optional[Dict[str, Any]]:
+    """Return an error dict if the crawl failed/returned a non-OK status, else None."""
+    if result is None:
+        return {"success": False, "url": url, "error": "crawler returned no result"}
+    if not getattr(result, "success", False):
+        return {"success": False, "url": url,
+                "error": getattr(result, "error_message", "crawl failed")}
+    if not _is_ok_status(result):
+        return {"success": False, "url": url,
+                "error": f"non-OK HTTP status: {getattr(result, 'status_code', 'unknown')}"}
+    return None
+
+
+@mcp.tool()
+async def capture_screenshot(ctx: Context, url: str, wait_for: float = 0.0) -> str:
+    """
+    Capture a full-page PNG screenshot of a URL and return it as base64.
+
+    Args:
+        url: The page URL to capture
+        wait_for: Optional seconds to wait before capture (for late-rendered content)
+
+    Returns:
+        JSON string with the base64-encoded PNG under `screenshot_base64`
+    """
+    try:
+        crawler = await ctx.request_context.lifespan_context.get_crawler()
+        config = CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS,
+            screenshot=True,
+            screenshot_wait_for=wait_for or None,
+        )
+        result = await crawler.arun(url=url, config=config)
+        err = _crawl_error_payload(url, result)
+        if err:
+            return json.dumps(err, indent=2)
+        if not getattr(result, "screenshot", None):
+            return json.dumps({"success": False, "url": url,
+                               "error": "no screenshot produced"}, indent=2)
+        return json.dumps({
+            "success": True,
+            "url": url,
+            "format": "png",
+            "encoding": "base64",
+            "screenshot_base64": result.screenshot,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "url": url, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def generate_pdf(ctx: Context, url: str) -> str:
+    """
+    Render a URL to PDF and return it as base64.
+
+    Args:
+        url: The page URL to render
+
+    Returns:
+        JSON string with the base64-encoded PDF under `pdf_base64`
+    """
+    try:
+        crawler = await ctx.request_context.lifespan_context.get_crawler()
+        config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, pdf=True)
+        result = await crawler.arun(url=url, config=config)
+        err = _crawl_error_payload(url, result)
+        if err:
+            return json.dumps(err, indent=2)
+        pdf_bytes = getattr(result, "pdf", None)
+        if not pdf_bytes:
+            return json.dumps({"success": False, "url": url,
+                               "error": "no pdf produced"}, indent=2)
+        return json.dumps({
+            "success": True,
+            "url": url,
+            "format": "pdf",
+            "encoding": "base64",
+            "pdf_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "url": url, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def execute_js(ctx: Context, url: str, scripts: Union[str, List[str]]) -> str:
+    """
+    Execute one or more JavaScript snippets on a page and return the crawl result.
+
+    Each snippet should be an expression (or IIFE / async function) that returns a value.
+    Snippets run in order in the page context.
+
+    Args:
+        url: The page URL to load
+        scripts: A single JS snippet or a list of snippets executed in order
+
+    Returns:
+        JSON string with markdown, internal/external links and js_execution_result
+    """
+    try:
+        js_list = [scripts] if isinstance(scripts, str) else list(scripts)
+        crawler = await ctx.request_context.lifespan_context.get_crawler()
+        config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, js_code=js_list)
+        result = await crawler.arun(url=url, config=config)
+        err = _crawl_error_payload(url, result)
+        if err:
+            return json.dumps(err, indent=2)
+        md = getattr(result, "markdown", None)
+        raw_md = getattr(md, "raw_markdown", None) or (md if isinstance(md, str) else "")
+        links = getattr(result, "links", {}) or {}
+        return json.dumps({
+            "success": True,
+            "url": url,
+            "js_execution_result": getattr(result, "js_execution_result", None),
+            "markdown": raw_md,
+            "internal_links": [l.get("href") for l in links.get("internal", [])],
+            "external_links": [l.get("href") for l in links.get("external", [])],
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "url": url, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def get_markdown(ctx: Context, url: str, filter_mode: str = "fit",
+                       query: str = None) -> str:
+    """
+    Convert a URL to Markdown with a selectable content filter.
+
+    Filter modes:
+    - fit (default): Pruning-based extraction of the main readable content
+    - raw: Full DOM-to-Markdown, no filtering
+    - bm25: BM25 relevance filtering against `query` (query is required)
+
+    Args:
+        url: The page URL to convert
+        filter_mode: One of 'fit', 'raw', 'bm25'
+        query: Search query, required only for bm25 mode
+
+    Returns:
+        JSON string with the resulting markdown under `markdown`
+    """
+    try:
+        from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter, BM25ContentFilter
+
+        mode = (filter_mode or "fit").lower()
+        if mode not in ("fit", "raw", "bm25"):
+            return json.dumps({"success": False, "url": url,
+                               "error": f"invalid filter_mode '{filter_mode}' (use fit|raw|bm25)"}, indent=2)
+        if mode == "bm25" and not query:
+            return json.dumps({"success": False, "url": url,
+                               "error": "bm25 filter_mode requires a non-empty query"}, indent=2)
+
+        content_filter = None
+        if mode == "fit":
+            content_filter = PruningContentFilter()
+        elif mode == "bm25":
+            content_filter = BM25ContentFilter(user_query=query)
+        md_generator = DefaultMarkdownGenerator(content_filter=content_filter)
+
+        crawler = await ctx.request_context.lifespan_context.get_crawler()
+        config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, markdown_generator=md_generator)
+        result = await crawler.arun(url=url, config=config)
+        err = _crawl_error_payload(url, result)
+        if err:
+            return json.dumps(err, indent=2)
+
+        md = getattr(result, "markdown", None)
+        raw_md = getattr(md, "raw_markdown", None) or (md if isinstance(md, str) else "")
+        fit_md = getattr(md, "fit_markdown", None)
+        markdown = raw_md if mode == "raw" else (fit_md or raw_md)
+        return json.dumps({
+            "success": True,
+            "url": url,
+            "filter_mode": mode,
+            "markdown": markdown,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "url": url, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def generate_schema_html(ctx: Context, url: str) -> str:
+    """
+    Crawl a URL and return sanitized HTML preprocessed for schema extraction.
+
+    Use this when building CSS/XPath extraction schemas: the returned HTML is
+    cleaned of noise so its structure is easier to reason about.
+
+    Args:
+        url: The page URL to crawl
+
+    Returns:
+        JSON string with the preprocessed HTML under `html`
+    """
+    try:
+        from crawl4ai.utils import preprocess_html_for_schema
+
+        crawler = await ctx.request_context.lifespan_context.get_crawler()
+        config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+        result = await crawler.arun(url=url, config=config)
+        err = _crawl_error_payload(url, result)
+        if err:
+            return json.dumps(err, indent=2)
+        source_html = getattr(result, "html", None) or getattr(result, "cleaned_html", None) or ""
+        if not source_html:
+            return json.dumps({"success": False, "url": url,
+                               "error": "no HTML content returned"}, indent=2)
+        return json.dumps({
+            "success": True,
+            "url": url,
+            "html": preprocess_html_for_schema(source_html),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "url": url, "error": str(e)}, indent=2)
+
+
+def _strip_json_fences(text: str) -> str:
+    """Strip surrounding ```json ... ``` (or bare ```) fences from an LLM response."""
+    s = text.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+
+@mcp.tool()
+async def extract_structured(ctx: Context, url: str, instruction: str,
+                             schema: str = None) -> str:
+    """
+    Crawl a URL to Markdown, then extract structured JSON from it with an LLM.
+
+    The LLM backend is the configured OpenAI-compatible endpoint (Ollama via
+    OLLAMA_BASE_URL) using MODEL_CHOICE. No crawl4ai LLMExtractionStrategy is used.
+
+    Args:
+        url: The page URL to extract from
+        instruction: Natural-language description of what to extract
+        schema: Optional JSON schema (as a string) describing the desired shape
+
+    Returns:
+        JSON string with the parsed extraction under `data`
+    """
+    try:
+        model_choice = os.getenv("MODEL_CHOICE")
+        if not model_choice:
+            return json.dumps({"success": False, "url": url,
+                               "error": "MODEL_CHOICE is not configured; extraction disabled"}, indent=2)
+
+        crawler = await ctx.request_context.lifespan_context.get_crawler()
+        config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+        result = await crawler.arun(url=url, config=config)
+        err = _crawl_error_payload(url, result)
+        if err:
+            return json.dumps(err, indent=2)
+
+        md = getattr(result, "markdown", None)
+        content = getattr(md, "fit_markdown", None) or getattr(md, "raw_markdown", None) \
+            or (md if isinstance(md, str) else "")
+        if not content:
+            return json.dumps({"success": False, "url": url,
+                               "error": "no markdown content to extract from"}, indent=2)
+
+        # Bound the context sent to the LLM to stay under the model window.
+        max_chars = int(os.getenv("EXTRACT_MAX_CHARS", "24000"))
+        content = content[:max_chars]
+
+        schema_block = f"\n\nReturn JSON matching this schema:\n{schema}" if schema else ""
+        prompt = (
+            "You extract structured data from web page content. "
+            "Return ONLY a valid JSON value, no prose, no markdown fences.\n\n"
+            f"Instruction: {instruction}{schema_block}\n\n"
+            f"Page content:\n{content}"
+        )
+
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434") + "/v1"
+        timeout = float(os.getenv("LLM_TIMEOUT", "60"))
+        client = openai.AsyncOpenAI(base_url=base_url,
+                                    api_key=os.getenv("OPENAI_API_KEY", "ollama"),
+                                    timeout=timeout)
+        response = await client.chat.completions.create(
+            model=model_choice,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            extra_body={"think": False},
+        )
+        raw = response.choices[0].message.content or ""
+        cleaned = _strip_json_fences(raw)
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return json.dumps({"success": False, "url": url,
+                               "error": "LLM did not return valid JSON",
+                               "raw_response": raw[:2000]}, indent=2)
+        return json.dumps({"success": True, "url": url, "data": data}, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "url": url, "error": str(e)}, indent=2)
 
 
 @mcp.tool()
