@@ -16,7 +16,7 @@ services:
       - "idle_in_transaction_session_timeout=60000"
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-rag}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rag}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
       - POSTGRES_DB=${POSTGRES_DB:-ragdb}
     volumes:
       - pgvector_data:/var/lib/postgresql/data
