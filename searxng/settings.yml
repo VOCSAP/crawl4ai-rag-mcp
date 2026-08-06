@@ -30,7 +30,13 @@ search:
 server:
   port: 8080
   bind_address: "0.0.0.0"
-  secret_key: "change_me_generate_with_openssl_rand_hex_32"  # REQUIRED: set a unique random value before deploying
+  # Overridden at runtime by the SEARXNG_SECRET environment variable, injected
+  # from .env by docker-compose.yml. SearXNG applies that override in
+  # searx/settings_defaults.py (SettingsValue(str, environ_name='SEARXNG_SECRET'))
+  # AFTER merging this file, so the env value always wins and no real secret
+  # ever lands in git. Keep the literal 'ultrasecretkey' placeholder: SearXNG
+  # exits with an explicit error if the override failed to apply.
+  secret_key: "ultrasecretkey"
   base_url: false
   image_proxy: false
   method: "POST"
