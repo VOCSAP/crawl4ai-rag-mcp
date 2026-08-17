@@ -112,8 +112,8 @@ services:
       - searxng
     volumes:
       - valkey-data:/data
-    mem_limit: 512m
-    memswap_limit: 512m      
+    mem_limit: 1g
+    memswap_limit: 1g      
     cap_drop:
       - ALL
     cap_add:
@@ -146,8 +146,8 @@ services:
       # Generate with: openssl rand -hex 32
       - SEARXNG_SECRET=${SEARXNG_SECRET:?SEARXNG_SECRET must be set in .env}
       - TZ=${TZ:-America/Sao_Paulo}
-    mem_limit: 512m
-    memswap_limit: 512m      
+    mem_limit: 1g
+    memswap_limit: 1g      
     cap_drop:
       - ALL
     cap_add:
