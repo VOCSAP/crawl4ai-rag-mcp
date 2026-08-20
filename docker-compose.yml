@@ -67,8 +67,8 @@ services:
       # No hf_cache bind mount: the reranker model is baked into the image at
       # build time (see Dockerfile). A host bind mount here would shadow the
       # baked /app/hf_cache with an empty dir and break offline rerank.
-    mem_limit: 1g
-    memswap_limit: 1g      
+    mem_limit: 2560m
+    memswap_limit: 3g      
     logging:
       driver: "json-file"
       options:
