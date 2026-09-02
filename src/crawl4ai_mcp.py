@@ -494,25 +494,16 @@ def process_code_example(args):
 @mcp.tool()
 async def search(ctx: Context, query: str, return_raw_markdown: bool = False, num_results: int = 6, batch_size: int = 20, max_concurrent: int = 10, max_rag_workers: int = 5) -> str:
     """
-    Comprehensive search tool that integrates SearXNG search with scraping and RAG functionality.
-    Optionally, use `return_raw_markdown=true` to return raw markdown for more detailed analysis.
-    
-    This tool performs a complete search, scrape, and RAG workflow:
-    1. Searches SearXNG with the provided query, obtaining `num_results` URLs
-    2. Extracts markdown from URLs, chunks embedding data into Supabase
-    3. Scrapes all returned URLs using existing scraping functionality
-    4. Returns organized results with comprehensive metadata
-    
+    Search the web, then scrape and index every result: SearXNG -> crawl -> Postgres.
+
+    Use it for research questions where the page content matters. For links and
+    snippets only, use searxng_search instead.
+
     Args:
-        query: The search query for SearXNG
-        return_raw_markdown: If True, skip embedding/RAG and return raw markdown content (default: False)
-        num_results: Number of search results to return from SearXNG (default: 6)
-        batch_size: Batch size for database operations (default: 20)
-        max_concurrent: Maximum concurrent browser sessions for scraping (default: 10)
-        max_rag_workers: Maximum concurrent RAG query workers for parallel processing (default: 5)
-    
-    Returns:
-        JSON string with search results, or raw markdown of each URL if `return_raw_markdown=true`
+        query: The search query
+        return_raw_markdown: Return each page's markdown instead of indexing it
+        num_results: URLs to fetch from SearXNG
+        batch_size, max_concurrent, max_rag_workers: throughput tuning, leave default
     """
     start_time = time.time()
     
@@ -783,23 +774,17 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
 @mcp.tool()
 async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: int = 10, batch_size: int = 20, return_raw_markdown: bool = False, chunk_size: int = 5000) -> str:
     """
-    Scrape **one or more URLs** and store their contents as embedding chunks in Postgres.
-    Optionally, use `return_raw_markdown=true` to return raw markdown content without storing.
+    Scrape a known set of URLs and index them in Postgres for later perform_rag_query.
 
-    The content is scraped and stored in Postgres for later retrieval and querying via perform_rag_query tool, unless
-    `return_raw_markdown=True` is specified, in which case raw markdown is returned directly.
+    Use it when you already know which pages you want. To follow links or expand a
+    sitemap, use smart_crawl_url instead.
 
     Args:
-        url: URL to scrape, or list of URLs for batch processing
-        max_concurrent: Maximum number of concurrent browser sessions for multi-URL mode (default: 10)
-        batch_size: Size of batches for database operations (default: 20)
-        return_raw_markdown: If True, skip database storage and return raw markdown content (default: False)
-        chunk_size: Maximum size in characters per chunk before embedding (default: 5000).
-            Lower this if the embedding model's n_ctx_train is small (e.g. 2048 for
-            nomic-embed-text:v1.5 -- use chunk_size ~3000 to stay safely under the limit).
-
-    Returns:
-        Summary of the scraping operation and storage in Postgres, or raw markdown content if requested
+        url: One URL, or a list of URLs to scrape in batch
+        return_raw_markdown: Return the markdown instead of indexing it
+        chunk_size: Characters per chunk before embedding. Lower it when the embedding
+            model's n_ctx_train is small (2048 on nomic-embed-text:v1.5 -> use ~3000)
+        max_concurrent, batch_size: throughput tuning, leave default
     """
     start_time = time.time()
     
@@ -1206,27 +1191,18 @@ async def _process_multiple_urls(
 @mcp.tool()
 async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, return_raw_markdown: bool = False, query: List[str] = None, max_rag_workers: int = 5) -> str:
     """
-    Intelligently crawl a URL based on its type and store content in Supabase.
-    Enhanced with raw markdown return and RAG query capabilities.
-    
-    This tool automatically detects the URL type and applies the appropriate crawling method:
-    - For sitemaps: Extracts and crawls all URLs in parallel
-    - For text files (llms.txt): Directly retrieves the content
-    - For regular webpages: Recursively crawls internal links up to the specified depth
-    
-    All crawled content is chunked and stored in Supabase for later retrieval and querying.
-    
+    Crawl a whole site or section and index it, dispatching on the URL type:
+    sitemap.xml crawls every listed URL (plain sitemaps only, NOT sitemap indexes),
+    .txt / llms.txt is fetched directly, a webpage follows internal links to max_depth.
+
+    Use scrape_urls instead for a fixed, already-known set of pages.
+
     Args:
-        url: URL to crawl (can be a regular webpage, sitemap.xml, or .txt file)
-        max_depth: Maximum recursion depth for regular URLs (default: 3)
-        max_concurrent: Maximum number of concurrent browser sessions (default: 10)
-        chunk_size: Maximum size of each content chunk in characters (default: 5000)
-        return_raw_markdown: If True, return raw markdown content instead of just storing (default: False)
-        query: List of queries to perform RAG search on crawled content (default: None)
-        max_rag_workers: Maximum concurrent RAG query workers for parallel processing (default: 5)
-    
-    Returns:
-        JSON string with crawl summary, raw markdown (if requested), or RAG query results
+        url: A webpage, a sitemap.xml or a .txt file
+        max_depth: Link-following depth, regular webpages only
+        return_raw_markdown: Return the markdown instead of indexing it
+        query: If given, runs one RAG search per query against the crawled content
+        chunk_size, max_concurrent, max_rag_workers: throughput tuning, leave default
     """
     try:
         # Get the crawler from the context
@@ -1498,20 +1474,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
 @mcp.tool()
 async def get_available_sources(ctx: Context) -> str:
     """
-    Get all available sources from the sources table.
-    
-    This tool returns a list of all unique sources (domains) that have been crawled and stored
-    in the database, along with their summaries and statistics. This is useful for discovering 
-    what content is available for querying.
+    List the crawled domains available for filtering, with their summary and word count.
 
-    Always use this tool before calling the RAG query or code example query tool
-    with a specific source filter!
-    
-    Args:
-        NONE
-    
-    Returns:
-        JSON string with the list of available sources and their details
+    Call this first whenever you intend to pass a source filter to perform_rag_query
+    or search_code_examples, so the filter value is a real one.
     """
     try:
         rows = get_all_sources()
@@ -1541,19 +1507,13 @@ async def get_available_sources(ctx: Context) -> str:
 @mcp.tool()
 async def perform_rag_query(ctx: Context, query: str, source: str = None, match_count: int = 5) -> str:
     """
-    Perform a RAG (Retrieval Augmented Generation) query on the stored content.
-    
-    This tool searches the vector database for content relevant to the query and returns
-    the matching documents. Optionally filter by source domain.
-    Get the source by using the get_available_sources tool before calling this search!
-    
+    Search the already-indexed page content (vector + keyword hybrid).
+
     Args:
         query: The search query
-        source: Optional source domain to filter results (e.g., 'example.com')
-        match_count: Maximum number of results to return (default: 5)
-    
-    Returns:
-        JSON string with the search results
+        source: Optional domain filter, e.g. 'example.com'. Get valid values from
+            get_available_sources first, a wrong one silently returns nothing
+        match_count: Max results, clamped to 50
     """
     import asyncio
     
@@ -1790,21 +1750,13 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
 @mcp.tool()
 async def search_code_examples(ctx: Context, query: str, source_id: str = None, match_count: int = 5) -> str:
     """
-    Search for code examples relevant to the query.
-    
-    This tool searches the vector database for code examples relevant to the query and returns
-    the matching examples with their summaries. Optionally filter by source_id.
-    Get the source_id by using the get_available_sources tool before calling this search!
+    Search the indexed code examples and their summaries. Requires USE_AGENTIC_RAG=true.
 
-    Use the get_available_sources tool first to see what sources are available for filtering.
-    
     Args:
         query: The search query
-        source_id: Optional source ID to filter results (e.g., 'example.com')
-        match_count: Maximum number of results to return (default: 5)
-    
-    Returns:
-        JSON string with the search results
+        source_id: Optional domain filter, e.g. 'example.com'. Get valid values from
+            get_available_sources first
+        match_count: Max results
     """
     # Check if code example extraction is enabled
     extract_code_examples_enabled = os.getenv("USE_AGENTIC_RAG", "false") == "true"
@@ -1988,21 +1940,17 @@ async def searxng_search(ctx: Context, query: str, categories: str = "general",
                          engines: str = None, language: str = None,
                          pageno: int = 1, num_results: int = 10) -> str:
     """
-    Search the web using SearXNG. Returns titles, URLs, and snippets without scraping or RAG.
+    Web metasearch via SearXNG: titles, URLs, snippets. No scraping, no indexing.
 
-    Use this for quick web searches where raw result links and summaries are sufficient.
-    For deep content retrieval with RAG, use the 'search' tool instead.
+    Use it when links and summaries are enough. Use the 'search' tool when you need
+    the actual page content.
 
     Args:
         query: The search query
-        categories: Comma-separated SearXNG categories (default: general)
-        engines: Comma-separated engine names (e.g. 'google,bing,duckduckgo')
-        language: Search language (e.g. 'en', 'fr')
-        pageno: Page number (default: 1)
-        num_results: Number of results to return (default: 10)
-
-    Returns:
-        JSON string with search results (title, url, snippet, engine)
+        categories: Comma-separated SearXNG categories
+        engines: Comma-separated engine names, e.g. 'google,bing,duckduckgo'
+        language: Language code, e.g. 'en', 'fr'
+        pageno, num_results: paging
     """
     result = _searxng_request(query, categories, engines, language, pageno, num_results)
     if not result["success"]:
@@ -2033,17 +1981,13 @@ async def searxng_images(ctx: Context, query: str, engines: str = None,
                          language: str = None, pageno: int = 1,
                          num_results: int = 10) -> str:
     """
-    Search for images using SearXNG. Returns image URLs and thumbnails directly.
+    Image metasearch via SearXNG. Returns direct image URLs and thumbnails.
 
     Args:
         query: The image search query
         engines: Comma-separated engine names
-        language: Search language (e.g. 'en', 'fr')
-        pageno: Page number (default: 1)
-        num_results: Number of results to return (default: 10)
-
-    Returns:
-        JSON string with image results (title, url, thumbnail_src, source)
+        language: Language code, e.g. 'en', 'fr'
+        pageno, num_results: paging
     """
     result = _searxng_request(query, "images", engines, language, pageno, num_results)
     if not result["success"]:
@@ -2073,17 +2017,13 @@ async def searxng_news(ctx: Context, query: str, engines: str = None,
                        language: str = None, pageno: int = 1,
                        num_results: int = 10) -> str:
     """
-    Search for recent news articles using SearXNG. Returns titles, URLs, and summaries directly.
+    Recent news metasearch via SearXNG. Results carry a publishedDate.
 
     Args:
         query: The news search query
         engines: Comma-separated engine names
-        language: Search language (e.g. 'en', 'fr')
-        pageno: Page number (default: 1)
-        num_results: Number of results to return (default: 10)
-
-    Returns:
-        JSON string with news results (title, url, snippet, publishedDate, engine)
+        language: Language code, e.g. 'en', 'fr'
+        pageno, num_results: paging
     """
     result = _searxng_request(query, "news", engines, language, pageno, num_results)
     if not result["success"]:
@@ -2125,14 +2065,11 @@ def _crawl_error_payload(url: str, result) -> Optional[Dict[str, Any]]:
 @mcp.tool()
 async def capture_screenshot(ctx: Context, url: str, wait_for: float = 0.0) -> str:
     """
-    Capture a full-page PNG screenshot of a URL and return it as base64.
+    Capture a full-page PNG screenshot, returned base64 under `screenshot_base64`.
 
     Args:
         url: The page URL to capture
-        wait_for: Optional seconds to wait before capture (for late-rendered content)
-
-    Returns:
-        JSON string with the base64-encoded PNG under `screenshot_base64`
+        wait_for: Seconds to wait before capturing, for late-rendered content
     """
     try:
         crawler = await ctx.request_context.lifespan_context.get_crawler()
@@ -2161,15 +2098,7 @@ async def capture_screenshot(ctx: Context, url: str, wait_for: float = 0.0) -> s
 
 @mcp.tool()
 async def generate_pdf(ctx: Context, url: str) -> str:
-    """
-    Render a URL to PDF and return it as base64.
-
-    Args:
-        url: The page URL to render
-
-    Returns:
-        JSON string with the base64-encoded PDF under `pdf_base64`
-    """
+    """Render a URL to PDF, returned base64 under `pdf_base64`."""
     try:
         crawler = await ctx.request_context.lifespan_context.get_crawler()
         config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, pdf=True)
@@ -2195,18 +2124,14 @@ async def generate_pdf(ctx: Context, url: str) -> str:
 @mcp.tool()
 async def execute_js(ctx: Context, url: str, scripts: Union[str, List[str]]) -> str:
     """
-    Execute one or more JavaScript snippets on a page and return the crawl result.
+    Run JavaScript on a page and return the crawl result plus js_execution_result.
 
-    Each snippet runs as the body of an async function, so use `return <value>;` to
-    surface a value (crawl4ai 0.9.0 convention). A bare expression runs but its value
-    is discarded. Snippets run in order in the page context.
+    Each snippet is the body of an async function: you MUST write `return <value>;`
+    to surface a value. A bare expression evaluates but its value is discarded.
 
     Args:
         url: The page URL to load
-        scripts: A single JS snippet or a list of snippets executed in order
-
-    Returns:
-        JSON string with markdown, internal/external links and js_execution_result
+        scripts: One JS snippet, or a list run in order in the page context
     """
     try:
         js_list = [scripts] if isinstance(scripts, str) else list(scripts)
@@ -2235,20 +2160,13 @@ async def execute_js(ctx: Context, url: str, scripts: Union[str, List[str]]) -> 
 async def get_markdown(ctx: Context, url: str, filter_mode: str = "fit",
                        query: str = None) -> str:
     """
-    Convert a URL to Markdown with a selectable content filter.
-
-    Filter modes:
-    - fit (default): Pruning-based extraction of the main readable content
-    - raw: Full DOM-to-Markdown, no filtering
-    - bm25: BM25 relevance filtering against `query` (query is required)
+    Convert one URL to Markdown, without indexing it.
 
     Args:
         url: The page URL to convert
-        filter_mode: One of 'fit', 'raw', 'bm25'
-        query: Search query, required only for bm25 mode
-
-    Returns:
-        JSON string with the resulting markdown under `markdown`
+        filter_mode: 'fit' prunes down to the main readable content, 'raw' converts
+            the whole DOM, 'bm25' keeps only the passages relevant to `query`
+        query: Required for bm25, ignored otherwise
     """
     try:
         from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter, BM25ContentFilter
@@ -2292,16 +2210,13 @@ async def get_markdown(ctx: Context, url: str, filter_mode: str = "fit",
 @mcp.tool()
 async def generate_schema_html(ctx: Context, url: str) -> str:
     """
-    Crawl a URL and return sanitized HTML preprocessed for schema extraction.
+    Return a page's HTML stripped of noise, under `html`.
 
-    Use this when building CSS/XPath extraction schemas: the returned HTML is
-    cleaned of noise so its structure is easier to reason about.
+    Use it when writing CSS or XPath extraction schemas: the cleaned structure is
+    far easier to reason about than the raw DOM.
 
     Args:
         url: The page URL to crawl
-
-    Returns:
-        JSON string with the preprocessed HTML under `html`
     """
     try:
         from crawl4ai.utils import preprocess_html_for_schema
@@ -2338,18 +2253,13 @@ def _strip_json_fences(text: str) -> str:
 async def extract_structured(ctx: Context, url: str, instruction: str,
                              schema: str = None) -> str:
     """
-    Crawl a URL to Markdown, then extract structured JSON from it with an LLM.
-
-    The LLM backend is the configured OpenAI-compatible endpoint (Ollama via
-    OLLAMA_BASE_URL) using MODEL_CHOICE. No crawl4ai LLMExtractionStrategy is used.
+    Crawl a URL to Markdown, then have an LLM pull structured JSON out of it,
+    returned under `data`. Requires MODEL_CHOICE to be set.
 
     Args:
         url: The page URL to extract from
-        instruction: Natural-language description of what to extract
-        schema: Optional JSON schema (as a string) describing the desired shape
-
-    Returns:
-        JSON string with the parsed extraction under `data`
+        instruction: What to extract, in plain language
+        schema: Optional JSON schema, as a string, describing the shape you want
     """
     try:
         model_choice = os.getenv("MODEL_CHOICE")
@@ -2419,27 +2329,39 @@ async def extract_structured(ctx: Context, url: str, instruction: str,
         return json.dumps({"success": False, "url": url, "error": str(e)}, indent=2)
 
 
-@mcp.tool()
+_KNOWLEDGE_GRAPH_ENABLED = os.getenv("USE_KNOWLEDGE_GRAPH", "false") == "true"
+
+
+def _knowledge_graph_tool():
+    """
+    Register the decorated tool with FastMCP only when USE_KNOWLEDGE_GRAPH=true.
+
+    The three Neo4j tools below are useless without a reachable Neo4j instance, and
+    every MCP client pays for their description on each session. Gating registration
+    keeps them out of the advertised tool list without touching their bodies: each
+    one keeps its own disabled-guard, so flipping the env var is the only change
+    needed to bring them back. When disabled, the undecorated function stays bound
+    in the module namespace so imports and internal callers keep working.
+
+    Read once at import time: propagate an .env change with `docker compose up -d`,
+    not `restart`, which keeps the container's original environment.
+    """
+    def decorator(fn):
+        return mcp.tool()(fn) if _KNOWLEDGE_GRAPH_ENABLED else fn
+    return decorator
+
+
+@_knowledge_graph_tool()
 async def check_ai_script_hallucinations(ctx: Context, script_path: str) -> str:
     """
-    Check an AI-generated Python script for hallucinations using the knowledge graph.
-    
-    This tool analyzes a Python script for potential AI hallucinations by validating
-    imports, method calls, class instantiations, and function calls against a Neo4j
-    knowledge graph containing real repository data.
-    
-    The tool performs comprehensive analysis including:
-    - Import validation against known repositories
-    - Method call validation on classes from the knowledge graph
-    - Class instantiation parameter validation
-    - Function call parameter validation
-    - Attribute access validation
-    
+    Validate an AI-generated Python script against the Neo4j knowledge graph.
+
+    Checks imports, method calls, class instantiations, function calls and attribute
+    access against repositories previously indexed by parse_github_repository, and
+    reports what does not exist, with confidence scores.
+
     Args:
         script_path: Absolute path to the Python script to analyze
-    
-    Returns:
-        JSON string with hallucination detection results, confidence scores, and recommendations
     """
     try:
         # Check if knowledge graph functionality is enabled
@@ -2514,70 +2436,30 @@ async def check_ai_script_hallucinations(ctx: Context, script_path: str) -> str:
             "error": f"Analysis failed: {str(e)}"
         }, indent=2)
 
-@mcp.tool()
+@_knowledge_graph_tool()
 async def query_knowledge_graph(ctx: Context, command: str) -> str:
     """
-    Query and explore the Neo4j knowledge graph containing repository data.
-    
-    This tool provides comprehensive access to the knowledge graph for exploring repositories,
-    classes, methods, functions, and their relationships. Perfect for understanding what data
-    is available for hallucination detection and debugging validation results.
-    
-    **⚠️ IMPORTANT: Always start with the `repos` command first!**
-    Before using any other commands, run `repos` to see what repositories are available
-    in your knowledge graph. This will help you understand what data you can explore.
-    
-    ## Available Commands:
-    
-    **Repository Commands:**
-    - `repos` - **START HERE!** List all repositories in the knowledge graph
-    - `explore <repo_name>` - Get detailed overview of a specific repository
-    
-    **Class Commands:**  
-    - `classes` - List all classes across all repositories (limited to 20)
-    - `classes <repo_name>` - List classes in a specific repository
-    - `class <class_name>` - Get detailed information about a specific class including methods and attributes
-    
-    **Method Commands:**
-    - `method <method_name>` - Search for methods by name across all classes
-    - `method <method_name> <class_name>` - Search for a method within a specific class
-    
-    **Custom Query:**
-    - `query <cypher_query>` - Execute a custom Cypher query (results limited to 20 records)
-    
-    ## Knowledge Graph Schema:
-    
-    **Node Types:**
-    - Repository: `(r:Repository {name: string})`
-    - File: `(f:File {path: string, module_name: string})`
-    - Class: `(c:Class {name: string, full_name: string})`
-    - Method: `(m:Method {name: string, params_list: [string], params_detailed: [string], return_type: string, args: [string]})`
-    - Function: `(func:Function {name: string, params_list: [string], params_detailed: [string], return_type: string, args: [string]})`
-    - Attribute: `(a:Attribute {name: string, type: string})`
-    
-    **Relationships:**
-    - `(r:Repository)-[:CONTAINS]->(f:File)`
-    - `(f:File)-[:DEFINES]->(c:Class)`
-    - `(c:Class)-[:HAS_METHOD]->(m:Method)`
-    - `(c:Class)-[:HAS_ATTRIBUTE]->(a:Attribute)`
-    - `(f:File)-[:DEFINES]->(func:Function)`
-    
-    ## Example Workflow:
-    ```
-    1. repos                                    # See what repositories are available
-    2. explore pydantic-ai                      # Explore a specific repository
-    3. classes pydantic-ai                      # List classes in that repository
-    4. class Agent                              # Explore the Agent class
-    5. method run_stream                        # Search for run_stream method
-    6. method __init__ Agent                    # Find Agent constructor
-    7. query "MATCH (c:Class)-[:HAS_METHOD]->(m:Method) WHERE m.name = 'run' RETURN c.name, m.name LIMIT 5"
-    ```
-    
+    Explore the Neo4j knowledge graph of repositories indexed by parse_github_repository.
+
+    Start with `repos`: every other command is scoped to what it lists.
+
+    Commands (results capped at 20):
+      repos                        List indexed repositories -- START HERE
+      explore <repo>               Overview of one repository
+      classes [<repo>]             List classes, optionally scoped to a repository
+      class <name>                 One class with its methods and attributes
+      method <name> [<class>]      Find a method, optionally within one class
+      query <cypher>               Run raw Cypher against the schema below
+
+    Schema for `query`:
+      (Repository {name})-[:CONTAINS]->(File {path, module_name})
+      (File)-[:DEFINES]->(Class {name, full_name})
+      (File)-[:DEFINES]->(Function {name, params_list, params_detailed, return_type, args})
+      (Class)-[:HAS_METHOD]->(Method {name, params_list, params_detailed, return_type, args})
+      (Class)-[:HAS_ATTRIBUTE]->(Attribute {name, type})
+
     Args:
-        command: Command string to execute (see available commands above)
-    
-    Returns:
-        JSON string with query results, statistics, and metadata
+        command: One of the command strings above
     """
     try:
         # Check if knowledge graph functionality is enabled
@@ -2968,26 +2850,17 @@ async def _handle_query_command(session, command: str, cypher_query: str) -> str
         }, indent=2)
 
 
-@mcp.tool()
+@_knowledge_graph_tool()
 async def parse_github_repository(ctx: Context, repo_url: str) -> str:
     """
-    Parse a GitHub repository into the Neo4j knowledge graph.
-    
-    This tool clones a GitHub repository, analyzes its Python files, and stores
-    the code structure (classes, methods, functions, imports) in Neo4j for use
-    in hallucination detection. The tool:
-    
-    - Clones the repository to a temporary location
-    - Analyzes Python files to extract code structure
-    - Stores classes, methods, functions, and imports in Neo4j
-    - Provides detailed statistics about the parsing results
-    - Automatically handles module name detection for imports
-    
+    Index a GitHub repository into the Neo4j knowledge graph.
+
+    Clones the repo, extracts the structure of its Python files (classes, methods,
+    functions, imports) and stores it so check_ai_script_hallucinations can validate
+    against it. Python only.
+
     Args:
-        repo_url: GitHub repository URL (e.g., 'https://github.com/user/repo.git')
-    
-    Returns:
-        JSON string with parsing results, statistics, and repository information
+        repo_url: GitHub repository URL, e.g. 'https://github.com/user/repo.git'
     """
     try:
         # Check if knowledge graph functionality is enabled
