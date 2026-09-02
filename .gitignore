@@ -22,6 +22,6 @@ crawl4ai-rag-mcp-plan.md
 .planning/
 tests/
 test_agentic.py
-CLAUDE.md
 KNOWN_ISSUES.md
 .kleos-space
+CLAUDE.local.md
