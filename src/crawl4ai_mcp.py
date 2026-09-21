@@ -914,18 +914,21 @@ def _index_crawl_payload(
     if job_id:
         bump_index_job(job_id)
 
-    degraded = 0
     if all_contents:
-        degraded = add_documents_to_db(
+        def _on_chunk(degraded: bool) -> None:
+            bump_index_job(job_id, done_delta=1, failed_delta=1 if degraded else 0)
+
+        add_documents_to_db(
             all_urls,
             all_chunk_numbers,
             all_contents,
             all_metadatas,
             all_url_to_full_document,
             batch_size=batch_size,
-        ) or 0
-    if job_id:
-        bump_index_job(job_id, done_delta=len(all_contents), failed_delta=degraded)
+            # Only fires with contextual embeddings on, which is also the only
+            # case that creates a job, so counters never go unreported.
+            on_chunk=_on_chunk if job_id else None,
+        )
 
     total_code_examples = 0
     if os.getenv("USE_AGENTIC_RAG", "false") == "true" and crawl_results:

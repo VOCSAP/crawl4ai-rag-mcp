@@ -282,6 +282,7 @@ def add_documents_to_db(
     batch_size: int = 20,
     *,
     conn=None,
+    on_chunk=None,
 ) -> int:
     """
     Add documents to the crawled_pages table in batches.
@@ -292,12 +293,18 @@ def add_documents_to_db(
     are indexed as their raw selves, so the count is a quality signal, not an
     error count.
 
+    `on_chunk(degraded: bool)` fires once per contextualised chunk, which is
+    where the minutes go: one LLM call each. It is the only granularity at
+    which a progress bar means anything. With contextual embeddings off the
+    whole call takes seconds and it never fires.
+
     A connection is borrowed from the pool for the duration of the call, then
     returned. Pass `conn=` to reuse an externally-held connection (tests).
     """
     with _conn_or_pool(conn) as conn:
         return _add_documents_to_db_impl(
-            conn, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size
+            conn, urls, chunk_numbers, contents, metadatas, url_to_full_document,
+            batch_size, on_chunk,
         )
 
 
@@ -309,6 +316,7 @@ def _add_documents_to_db_impl(
     metadatas: List[Dict[str, Any]],
     url_to_full_document: Dict[str, str],
     batch_size: int,
+    on_chunk=None,
 ) -> int:
     degraded_chunks = 0
     unique_urls = list(set(urls))
@@ -358,17 +366,20 @@ def _add_documents_to_db_impl(
 
                 for future in concurrent.futures.as_completed(future_to_idx):
                     idx = future_to_idx[future]
+                    degraded = True
                     try:
                         result, success = future.result()
                         contextual_contents.append(result)
                         if success:
                             batch_metadatas[idx]["contextual_embedding"] = True
-                        else:
-                            degraded_chunks += 1
+                            degraded = False
                     except Exception as e:
                         print(f"Error processing chunk {idx}: {e}")
                         contextual_contents.append(batch_contents[idx])
+                    if degraded:
                         degraded_chunks += 1
+                    if on_chunk:
+                        on_chunk(degraded)
 
             if len(contextual_contents) != len(batch_contents):
                 print(f"Warning: Expected {len(batch_contents)} results but got {len(contextual_contents)}")

@@ -137,13 +137,45 @@ def test_a_long_job_keeps_its_heartbeat_fresh_while_it_works():
         _purge(job_id)
 
 
+def test_progress_advances_chunk_by_chunk_not_in_one_jump():
+    """A follower should see 12/37 then 13/37 at the real pace of the work, not
+    0/37 for nineteen minutes and then 37/37."""
+    utils.ensure_index_jobs_table()
+    job_id = utils.create_index_job(total=4)
+    seen = []
+    real = mod.add_documents_to_db
+
+    def _fake_add(*a, on_chunk=None, **k):
+        for _ in range(4):
+            if on_chunk:
+                on_chunk(False)
+            seen.append(utils.get_index_job(job_id)["done"])
+        return 0
+
+    mod.add_documents_to_db = _fake_add
+    try:
+        mod._index_crawl_payload(job_id, {}, {}, ["u"], [0], ["c"] * 4, [{}] * 4, {}, [], 20)
+        assert seen == [1, 2, 3, 4], f"done went {seen}, so progress is not per chunk"
+        assert utils.get_index_job(job_id)["done"] == 4, "the total was counted twice"
+    finally:
+        mod.add_documents_to_db = real
+        _purge(job_id)
+
+
 def test_chunks_that_lost_their_context_are_counted_on_the_job():
     """A chunk whose LLM context call fails is still indexed, as its raw self.
     Silently reporting zero failures would hide a degraded index."""
     utils.ensure_index_jobs_table()
     job_id = utils.create_index_job(total=5)
     real = mod.add_documents_to_db
-    mod.add_documents_to_db = lambda *a, **k: 2
+
+    def _fake_add(*a, on_chunk=None, **k):
+        for i in range(5):
+            if on_chunk:
+                on_chunk(i < 2)  # the first two lost their context
+        return 2
+
+    mod.add_documents_to_db = _fake_add
     try:
         mod._index_crawl_payload(job_id, {}, {}, ["u"], [0], ["c"] * 5, [{}] * 5, {}, [], 20)
         job = utils.get_index_job(job_id)
@@ -156,6 +188,7 @@ def test_chunks_that_lost_their_context_are_counted_on_the_job():
 
 TESTS = [
     test_running_a_job_leaves_the_event_loop_free,
+    test_progress_advances_chunk_by_chunk_not_in_one_jump,
     test_chunks_that_lost_their_context_are_counted_on_the_job,
     test_a_long_job_keeps_its_heartbeat_fresh_while_it_works,
     test_a_completed_job_ends_done,
