@@ -885,6 +885,97 @@ async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: 
         }, indent=2)
 
 
+def _index_crawl_payload(
+    job_id: Optional[str],
+    source_content_map: Dict[str, str],
+    source_word_counts: Dict[str, int],
+    all_urls: List[str],
+    all_chunk_numbers: List[int],
+    all_contents: List[str],
+    all_metadatas: List[Dict[str, Any]],
+    all_url_to_full_document: Dict[str, str],
+    crawl_results: List[Dict[str, Any]],
+    batch_size: int,
+) -> int:
+    """Index a finished crawl and return how many code examples were stored.
+
+    Synchronous end to end, and slow enough to be worth deferring: with
+    contextual embeddings on, every chunk costs an LLM call. Runs either inline
+    or inside a background job, hence the optional job_id used for progress.
+    """
+    if source_content_map:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            source_summary_args = [(source_id, content) for source_id, content in source_content_map.items()]
+            source_summaries = list(executor.map(lambda args: extract_source_summary(args[0], args[1]), source_summary_args))
+
+        for (source_id, _), summary in zip(source_summary_args, source_summaries):
+            update_source_info(source_id, summary, source_word_counts.get(source_id, 0))
+    if job_id:
+        bump_index_job(job_id)
+
+    if all_contents:
+        add_documents_to_db(
+            all_urls,
+            all_chunk_numbers,
+            all_contents,
+            all_metadatas,
+            all_url_to_full_document,
+            batch_size=batch_size,
+        )
+    if job_id:
+        bump_index_job(job_id, done_delta=len(all_contents))
+
+    total_code_examples = 0
+    if os.getenv("USE_AGENTIC_RAG", "false") == "true" and crawl_results:
+        code_urls = []
+        code_chunk_numbers = []
+        code_examples = []
+        code_summaries = []
+        code_metadatas = []
+
+        for doc in crawl_results:
+            if doc.get('markdown'):
+                source_url = doc['url']
+                code_blocks = extract_code_blocks(doc['markdown'])
+
+                if code_blocks:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                        summary_args = [(block['code'], block['context_before'], block['context_after'])
+                                        for block in code_blocks]
+                        summaries = list(executor.map(process_code_example, summary_args))
+
+                    parsed_url = urlparse(source_url)
+                    source_id = parsed_url.netloc or parsed_url.path
+
+                    for block, summary in zip(code_blocks, summaries):
+                        code_urls.append(source_url)
+                        code_chunk_numbers.append(len(code_examples))
+                        code_examples.append(block['code'])
+                        code_summaries.append(summary)
+                        code_metadatas.append({
+                            "chunk_index": len(code_examples) - 1,
+                            "url": source_url,
+                            "source": source_id,
+                            "char_count": len(block['code']),
+                            "word_count": len(block['code'].split())
+                        })
+
+        if code_examples:
+            add_code_examples_to_db(
+                code_urls,
+                code_chunk_numbers,
+                code_examples,
+                code_summaries,
+                code_metadatas,
+                batch_size=batch_size,
+            )
+            total_code_examples = len(code_examples)
+    if job_id:
+        bump_index_job(job_id)
+
+    return total_code_examples
+
+
 async def _process_multiple_urls(
     crawler: AsyncWebCrawler,
     urls: List[str],
@@ -1064,82 +1155,30 @@ async def _process_multiple_urls(
                 })
                 failed_urls += 1
         
-        # Update source information in parallel (if any successful crawls)
-        if source_content_map:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                source_summary_args = [(source_id, content) for source_id, content in source_content_map.items()]
-                source_summaries = list(executor.map(lambda args: extract_source_summary(args[0], args[1]), source_summary_args))
-            
-            for (source_id, _), summary in zip(source_summary_args, source_summaries):
-                word_count = source_word_counts.get(source_id, 0)
-                update_source_info(source_id, summary, word_count)
+        outcome: Dict[str, int] = {}
 
-        # Add documentation chunks to Supabase in batches (if any)
-        if all_contents:
-            add_documents_to_db(
+        def _index_and_capture(job_id):
+            outcome["code_examples"] = _index_crawl_payload(
+                job_id,
+                source_content_map,
+                source_word_counts,
                 all_urls,
                 all_chunk_numbers,
                 all_contents,
                 all_metadatas,
                 all_url_to_full_document,
-                batch_size=batch_size
+                crawl_results,
+                batch_size,
             )
-        
-        # Process code examples from all successful documents (if enabled)
-        total_code_examples = 0
-        extract_code_examples_enabled = os.getenv("USE_AGENTIC_RAG", "false") == "true"
-        if extract_code_examples_enabled and crawl_results:
-            code_urls = []
-            code_chunk_numbers = []
-            code_examples = []
-            code_summaries = []
-            code_metadatas = []
-            
-            # Extract code blocks from all successful documents
-            for doc in crawl_results:
-                if doc.get('markdown'):
-                    source_url = doc['url']
-                    md = doc['markdown']
-                    code_blocks = extract_code_blocks(md)
-                    
-                    if code_blocks:
-                        # Process code examples in parallel
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                            summary_args = [(block['code'], block['context_before'], block['context_after'])
-                                            for block in code_blocks]
-                            summaries = list(executor.map(process_code_example, summary_args))
-                        
-                        # Prepare code example data
-                        parsed_url = urlparse(source_url)
-                        source_id = parsed_url.netloc or parsed_url.path
-                        
-                        for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
-                            code_urls.append(source_url)
-                            code_chunk_numbers.append(len(code_examples))
-                            code_examples.append(block['code'])
-                            code_summaries.append(summary)
-                            
-                            code_meta = {
-                                "chunk_index": len(code_examples) - 1,
-                                "url": source_url,
-                                "source": source_id,
-                                "char_count": len(block['code']),
-                                "word_count": len(block['code'].split())
-                            }
-                            code_metadatas.append(code_meta)
-            
-            # Add all code examples to Supabase
-            if code_examples:
-                add_code_examples_to_db(
-                    code_urls,
-                    code_chunk_numbers,
-                    code_examples,
-                    code_summaries,
-                    code_metadatas,
-                    batch_size=batch_size
-                )
-                total_code_examples = len(code_examples)
-        
+
+        job_id = await _dispatch_indexing(_index_and_capture, total=len(all_contents))
+        # None rather than 0 on the deferred path: the count is not yet known,
+        # and reporting zero would read as "nothing was stored".
+        total_code_examples = outcome.get("code_examples", 0) if job_id is None else None
+        job_fields = (
+            {} if job_id is None
+            else {"job_id": job_id, "indexing": "queued", "follow": _follow_command(job_id)}
+        )
         # Calculate processing time
         processing_time = time.time() - start_time
         
@@ -1166,7 +1205,8 @@ async def _process_multiple_urls(
                     "links_count": {
                         "internal": len(first_crawl_result.get("links", {}).get("internal", [])) if first_crawl_result else 0,
                         "external": len(first_crawl_result.get("links", {}).get("external", [])) if first_crawl_result else 0
-                    }
+                    },
+                    **job_fields
                 }, indent=2)
             else:
                 # Single URL failed
@@ -1198,7 +1238,8 @@ async def _process_multiple_urls(
                     "max_concurrent": max_concurrent,
                     "batch_size": batch_size,
                     "average_time_per_url": round(processing_time / len(urls), 2) if urls else 0
-                }
+                },
+                **job_fields
             }, indent=2)
         
     except Exception as e:

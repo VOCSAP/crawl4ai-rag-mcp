@@ -41,6 +41,21 @@ Fork de `ToKiDoO/crawl4ai-rag-mcp` adapté pour un déploiement 100% local :
 | `DATABASE_URL` | DSN Postgres | aucun -- obligatoire, `_build_db_pool` lève sinon |
 | `SEARXNG_URL` | Endpoint SearXNG interne Docker | `http://searxng:8080` |
 | `OPENAI_API_KEY` | Valeur factice (`ollama`) ou master key LiteLLM | -- |
+| `INDEX_JOB_CONCURRENCY` | Jobs d'indexation traités en parallèle | `1` |
+| `INDEX_JOB_STALE_SECONDS` | Âge du heartbeat au-delà duquel un job `running` est rendu `lost` | `300` |
+| `INDEX_JOB_FOLLOW_BASE_URL` | Base d'URL publique utilisée pour construire la commande `follow` rendue par `scrape_urls` | `http://localhost:8051` |
+| `INDEX_JOB_STREAM_POLL_SECONDS` | Fréquence d'interrogation de la base par `/jobs/{id}/stream` | `0.5` |
+| `INDEX_JOB_STREAM_KEEPALIVE_SECONDS` | Intervalle maximal entre deux lignes du flux. Doit rester bien sous le `proxy_read_timeout` de nginx (60 s par défaut) | `10` |
+
+## Indexation asynchrone
+
+Quand `USE_CONTEXTUAL_EMBEDDINGS=true`, `scrape_urls` rend le fetch immédiatement et confie l'indexation à un job de fond, dont le retour porte `job_id`, `indexing` et `follow` (une commande `curl` prête à l'emploi). Quand la variable est à `false`, le pipeline tient en quelques secondes : aucun job n'est créé et le retour est inchangé.
+
+Deux raisons, dont une qui n'est pas du confort : le pipeline d'indexation est synchrone de bout en bout, donc l'exécuter dans la coroutine de l'outil gelait l'event loop du serveur pendant toute sa durée, `/health` et les autres sessions MCP comprises. Il passe désormais par `asyncio.to_thread`.
+
+La charge réelle vers Ollama vaut `INDEX_JOB_CONCURRENCY x CONTEXTUAL_EMBEDDING_WORKERS`. Monter la concurrence sans monter `mem_limit` reproduit l'OOM kill, et le `memory_threshold_percent` de crawl4ai ne protège de rien ici : il lit `/proc/meminfo`, pas le cgroup (détail en `KNOWN_ISSUES.md` section VII).
+
+Conception complète et alternatives écartées : `docs/superpowers/specs/2026-09-21-async-indexing-jobs-design.md`.
 
 **Règle stricte :** ne JAMAIS hardcoder une IP, un nom de modèle ou une dimension dans le code. Toujours passer par les env vars ci-dessus.
 

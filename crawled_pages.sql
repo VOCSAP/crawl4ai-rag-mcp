@@ -145,3 +145,20 @@ begin
 end;
 $$;
 
+
+-- Asynchronous indexing jobs.
+-- Also created at runtime by utils.ensure_index_jobs_table(), because this
+-- file only runs on a first `up` through docker-entrypoint-initdb.d and would
+-- never reach a volume that already exists.
+CREATE TABLE IF NOT EXISTS index_jobs (
+    id            uuid PRIMARY KEY,
+    state         text NOT NULL,
+    total         integer NOT NULL DEFAULT 0,
+    done          integer NOT NULL DEFAULT 0,
+    failed        integer NOT NULL DEFAULT 0,
+    error         text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    started_at    timestamptz,
+    finished_at   timestamptz,
+    heartbeat_at  timestamptz
+);
