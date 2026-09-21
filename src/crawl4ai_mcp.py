@@ -918,6 +918,8 @@ def _index_crawl_payload(
         def _on_chunk(degraded: bool) -> None:
             bump_index_job(job_id, done_delta=1, failed_delta=1 if degraded else 0)
 
+        # The return value is dropped on purpose: _on_chunk already counted
+        # every degraded chunk, so feeding it back would count them twice.
         add_documents_to_db(
             all_urls,
             all_chunk_numbers,
