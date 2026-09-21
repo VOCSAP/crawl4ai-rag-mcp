@@ -19,6 +19,13 @@ import crawl4ai_mcp as mod
 PAGE = "# Title\n\n" + ("body text that is long enough to chunk. " * 200)
 
 
+def _count_jobs():
+    with utils._pool_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM index_jobs")
+            return cur.fetchone()[0]
+
+
 def _purge(job_id):
     with utils._pool_conn() as conn:
         with conn.cursor() as cur:
@@ -72,15 +79,20 @@ def test_without_contextual_embeddings_nothing_changes_for_the_caller():
     assert body["success"] is True
 
 
-def _run_smart_crawl(query=None):
+def _run_smart_crawl(query=None, trace=None):
     """Drive smart_crawl_url on a plain page, crawl and indexing stubbed."""
     real_single, real_index = mod.crawl_markdown_file, mod._index_crawl_payload
 
     async def _fake_single(crawler, url):
         return [{"url": url, "markdown": PAGE}]
 
+    def _fake_index(*a, **k):
+        if trace is not None:
+            trace.append("indexed")
+        return 0
+
     mod.crawl_markdown_file = _fake_single
-    mod._index_crawl_payload = lambda *a, **k: 0
+    mod._index_crawl_payload = _fake_index
 
     class _Ctx:
         class request_context:
@@ -111,11 +123,33 @@ def test_smart_crawl_still_answers_after_the_indexing_moved_out():
 
 
 def test_smart_crawl_in_query_mode_indexes_before_it_searches():
+    """Asserting the absence of job fields would prove nothing: the query reply
+    never carries them. What matters is that the indexing already ran when the
+    call returns, since the query reads it back."""
     os.environ["USE_CONTEXTUAL_EMBEDDINGS"] = "true"
-    body = _run_smart_crawl(query="anything")
-    assert "job_id" not in body, (
-        "query mode deferred the indexing, so it searched an index that is not "
-        "filled yet"
+    utils.ensure_index_jobs_table()
+    trace = []
+    real_rag = mod.perform_rag_query
+
+    async def _spy_rag(*a, **k):
+        trace.append("searched")
+        return json.dumps({"success": True, "results": []})
+
+    mod.perform_rag_query = _spy_rag
+    before = _count_jobs()
+    try:
+        body = _run_smart_crawl(query="anything", trace=trace)
+    finally:
+        mod.perform_rag_query = real_rag
+
+    assert body.get("success") is True, f"smart_crawl_url failed in query mode: {body}"
+    assert "indexed" in trace, "the indexing never ran on the query path"
+    # The decisive check. Asserting the order would race: a deferred task can
+    # still happen to run before the search. A job row cannot exist at all if
+    # the indexing stayed inline.
+    assert _count_jobs() == before, (
+        "query mode created a background job, so the search reads an index that "
+        "is not filled yet"
     )
 
 

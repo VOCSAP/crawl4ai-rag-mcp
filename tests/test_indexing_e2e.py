@@ -61,8 +61,68 @@ def test_the_real_writer_reports_every_chunk_it_stores():
         _purge_probe()
 
 
+def test_the_real_writer_counts_chunks_that_lost_their_context():
+    """Only the success branch was exercised against real code. A chunk whose
+    context call raises is still stored, as its raw self, and must be counted."""
+    os.environ["USE_CONTEXTUAL_EMBEDDINGS"] = "true"
+    chunks = ["delta text for probe", "epsilon text for probe"]
+    seen = []
+    real_context = utils.generate_contextual_embedding
+
+    def _boom(_doc, _chunk):
+        raise RuntimeError("context model unreachable")
+
+    utils.generate_contextual_embedding = _boom
+    try:
+        utils.update_source_info("probe.invalid", "progress probe", 0)
+        degraded = utils.add_documents_to_db(
+            [PROBE_URL] * 2,
+            [0, 1],
+            chunks,
+            [{"source": "probe.invalid"} for _ in chunks],
+            {PROBE_URL: " ".join(chunks)},
+            batch_size=20,
+            on_chunk=lambda was_degraded: seen.append(was_degraded),
+        )
+        assert degraded == 2, f"expected 2 degraded chunks, writer reported {degraded}"
+        assert seen == [True, True], f"the callback reported {seen}"
+    finally:
+        utils.generate_contextual_embedding = real_context
+        _purge_probe()
+
+
+def test_the_callback_survives_the_batch_boundary():
+    """Chunks are written in batches. A counter reset per batch would go
+    unnoticed with a single batch, which is all the other tests use."""
+    os.environ["USE_CONTEXTUAL_EMBEDDINGS"] = "true"
+    chunks = [f"chunk number {i} for the batch probe" for i in range(5)]
+    seen = []
+    real_context = utils.generate_contextual_embedding
+    utils.generate_contextual_embedding = lambda _doc, chunk: (chunk, True)
+    try:
+        utils.update_source_info("probe.invalid", "progress probe", 0)
+        utils.add_documents_to_db(
+            [PROBE_URL] * 5,
+            list(range(5)),
+            chunks,
+            [{"source": "probe.invalid"} for _ in chunks],
+            {PROBE_URL: " ".join(chunks)},
+            batch_size=2,
+            on_chunk=lambda was_degraded: seen.append(was_degraded),
+        )
+        assert len(seen) == 5, (
+            f"5 chunks over 3 batches of 2 produced {len(seen)} callbacks: "
+            "progress is lost at a batch boundary"
+        )
+    finally:
+        utils.generate_contextual_embedding = real_context
+        _purge_probe()
+
+
 TESTS = [
     test_the_real_writer_reports_every_chunk_it_stores,
+    test_the_real_writer_counts_chunks_that_lost_their_context,
+    test_the_callback_survives_the_batch_boundary,
 ]
 
 

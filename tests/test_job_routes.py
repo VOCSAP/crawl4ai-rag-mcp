@@ -4,6 +4,7 @@ Runnable without pytest (``python tests/test_job_routes.py``). Drives the real
 Starlette app through TestClient, so a route that is never registered fails
 here rather than in production.
 """
+import asyncio
 import json
 import os
 import sys
@@ -22,6 +23,8 @@ import crawl4ai_mcp as mod
 from starlette.testclient import TestClient
 
 CLIENT = TestClient(mod.mcp.streamable_http_app())
+
+JOB_SECONDS = 1.0
 
 
 def _purge(job_id):
@@ -101,7 +104,50 @@ def test_the_stream_keeps_alive_while_nothing_progresses():
         _purge(job_id)
 
 
+def test_health_answers_promptly_while_a_job_is_running():
+    """The contract's own wording, over the real route.
+
+    Two things this test got wrong before and that its negative control
+    caught. TestClient serves the app in its own event loop on another thread,
+    so a job blocking this one went unnoticed: the request has to share the
+    loop, hence ASGITransport here. And the status code proves nothing, since a
+    blocked loop still answers 200 once it unblocks. Latency is the signal.
+    """
+    from httpx import AsyncClient, ASGITransport
+
+    utils.ensure_index_jobs_table()
+    os.environ["USE_CONTEXTUAL_EMBEDDINGS"] = "true"
+    codes = []
+
+    async def _scenario():
+        # Timed as one block, job start included: a task created here does not
+        # run until the next await, so timing only the requests would measure
+        # the loop after the stall rather than during it.
+        started = time.monotonic()
+        job_id = await mod._dispatch_indexing(lambda _j: time.sleep(JOB_SECONDS), total=1)
+        # Hands control to the scheduler so the job task actually starts. Without
+        # it the task never runs during the measurement: an ASGITransport request
+        # is coroutines all the way down with no real I/O, so it never yields.
+        await asyncio.sleep(0.05)
+        transport = ASGITransport(app=mod.mcp.streamable_http_app())
+        async with AsyncClient(transport=transport, base_url="http://probe") as client:
+            for _ in range(5):
+                codes.append((await client.get("/health")).status_code)
+        return job_id, time.monotonic() - started
+
+    job_id, elapsed = asyncio.run(_scenario())
+    try:
+        assert codes == [200] * 5, f"/health answered {codes} while a job ran"
+        assert elapsed < JOB_SECONDS / 2, (
+            f"five /health calls took {elapsed:.2f}s against a {JOB_SECONDS}s job: "
+            "the indexing is back on the event loop"
+        )
+    finally:
+        _purge(job_id)
+
+
 TESTS = [
+    test_health_answers_promptly_while_a_job_is_running,
     test_reading_an_unknown_job_is_404,
     test_reading_a_job_returns_its_counters,
     test_following_an_unknown_job_is_404_not_an_empty_stream,
