@@ -282,16 +282,21 @@ def add_documents_to_db(
     batch_size: int = 20,
     *,
     conn=None,
-) -> None:
+) -> int:
     """
     Add documents to the crawled_pages table in batches.
     Deletes existing records with the same URLs before inserting.
+
+    Returns how many chunks were stored without their LLM context, which only
+    happens when contextual embeddings are on and the call failed. Those chunks
+    are indexed as their raw selves, so the count is a quality signal, not an
+    error count.
 
     A connection is borrowed from the pool for the duration of the call, then
     returned. Pass `conn=` to reuse an externally-held connection (tests).
     """
     with _conn_or_pool(conn) as conn:
-        _add_documents_to_db_impl(
+        return _add_documents_to_db_impl(
             conn, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size
         )
 
@@ -304,7 +309,8 @@ def _add_documents_to_db_impl(
     metadatas: List[Dict[str, Any]],
     url_to_full_document: Dict[str, str],
     batch_size: int,
-) -> None:
+) -> int:
+    degraded_chunks = 0
     unique_urls = list(set(urls))
 
     try:
@@ -357,9 +363,12 @@ def _add_documents_to_db_impl(
                         contextual_contents.append(result)
                         if success:
                             batch_metadatas[idx]["contextual_embedding"] = True
+                        else:
+                            degraded_chunks += 1
                     except Exception as e:
                         print(f"Error processing chunk {idx}: {e}")
                         contextual_contents.append(batch_contents[idx])
+                        degraded_chunks += 1
 
             if len(contextual_contents) != len(batch_contents):
                 print(f"Warning: Expected {len(batch_contents)} results but got {len(contextual_contents)}")
@@ -438,6 +447,8 @@ def _add_documents_to_db_impl(
 
                     if successful_inserts > 0:
                         print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
+
+    return degraded_chunks
 
 
 def search_documents(
@@ -1129,6 +1140,30 @@ _LIVE_STATE_SQL = """
           AND heartbeat_at < now() - make_interval(secs => %s)
          THEN 'lost' ELSE state END
 """
+
+
+def abandon_orphaned_index_jobs(*, conn=None) -> int:
+    """Fail every job left unfinished by a previous process, and count them.
+
+    The work to run is a closure held in memory, so a job that outlives its
+    process has nobody left to run it. A queued job is never derived as lost
+    either, since that derivation only looks at running ones: without this it
+    would sit there forever and its follower would never be told.
+    """
+    with _conn_or_pool(conn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE index_jobs
+                   SET state = 'failed',
+                       error = 'abandoned: the server restarted before this job ran',
+                       finished_at = now()
+                 WHERE state IN ('queued', 'running')
+                """
+            )
+            abandoned = cur.rowcount
+        conn.commit()
+    return abandoned
 
 
 def get_index_job(job_id: str, *, conn=None) -> Optional[Dict[str, Any]]:

@@ -48,6 +48,7 @@ from utils import (
     keyword_search_crawled_pages,
     keyword_search_code_examples,
     ensure_index_jobs_table,
+    abandon_orphaned_index_jobs,
     create_index_job,
     get_index_job,
     start_index_job,
@@ -913,17 +914,18 @@ def _index_crawl_payload(
     if job_id:
         bump_index_job(job_id)
 
+    degraded = 0
     if all_contents:
-        add_documents_to_db(
+        degraded = add_documents_to_db(
             all_urls,
             all_chunk_numbers,
             all_contents,
             all_metadatas,
             all_url_to_full_document,
             batch_size=batch_size,
-        )
+        ) or 0
     if job_id:
-        bump_index_job(job_id, done_delta=len(all_contents))
+        bump_index_job(job_id, done_delta=len(all_contents), failed_delta=degraded)
 
     total_code_examples = 0
     if os.getenv("USE_AGENTIC_RAG", "false") == "true" and crawl_results:
@@ -1384,76 +1386,33 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         for doc in crawl_results:
             url_to_full_document[doc['url']] = doc['markdown']
         
-        # Update source information for each unique source FIRST (before inserting documents)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            source_summary_args = [(source_id, content) for source_id, content in source_content_map.items()]
-            source_summaries = list(executor.map(lambda args: extract_source_summary(args[0], args[1]), source_summary_args))
-        
-        for (source_id, _), summary in zip(source_summary_args, source_summaries):
-            word_count = source_word_counts.get(source_id, 0)
-            update_source_info(source_id, summary, word_count)
-
-        # Add documentation chunks to Supabase (AFTER sources exist)
         batch_size = 20
-        add_documents_to_db(urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
-        
-        # Extract and process code examples from all documents only if enabled
-        code_examples = []
-        extract_code_examples_enabled = os.getenv("USE_AGENTIC_RAG", "false") == "true"
-        if extract_code_examples_enabled:
-            all_code_blocks = []
-            code_urls = []
-            code_chunk_numbers = []
-            code_summaries = []
-            code_metadatas = []
-            
-            # Extract code blocks from all documents
-            for doc in crawl_results:
-                source_url = doc['url']
-                md = doc['markdown']
-                code_blocks = extract_code_blocks(md)
-                
-                if code_blocks:
-                    # Process code examples in parallel
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                        # Prepare arguments for parallel processing
-                        summary_args = [(block['code'], block['context_before'], block['context_after'])
-                                        for block in code_blocks]
-                        
-                        # Generate summaries in parallel
-                        summaries = list(executor.map(process_code_example, summary_args))
-                    
-                    # Prepare code example data
-                    parsed_url = urlparse(source_url)
-                    source_id = parsed_url.netloc or parsed_url.path
-                    
-                    for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
-                        code_urls.append(source_url)
-                        code_chunk_numbers.append(len(code_examples))  # Use global code example index
-                        code_examples.append(block['code'])
-                        code_summaries.append(summary)
-                        
-                        # Create metadata for code example
-                        code_meta = {
-                            "chunk_index": len(code_examples) - 1,
-                            "url": source_url,
-                            "source": source_id,
-                            "char_count": len(block['code']),
-                            "word_count": len(block['code'].split())
-                        }
-                        code_metadatas.append(code_meta)
-            
-            # Add all code examples to Supabase
-            if code_examples:
-                add_code_examples_to_db(
-                    code_urls,
-                    code_chunk_numbers,
-                    code_examples,
-                    code_summaries,
-                    code_metadatas,
-                    batch_size=batch_size
-                )
-        
+        outcome: Dict[str, int] = {}
+        # The query mode below reads back what is indexed here, so deferring
+        # would make it search an index that is not filled yet.
+        job_id = await _dispatch_indexing(
+            lambda jid: outcome.__setitem__("code_examples", _index_crawl_payload(
+                jid,
+                source_content_map,
+                source_word_counts,
+                urls,
+                chunk_numbers,
+                contents,
+                metadatas,
+                url_to_full_document,
+                crawl_results,
+                batch_size,
+            )),
+            total=len(contents),
+            allow_defer=not (query and len(query) > 0),
+        )
+        # None rather than 0 on the deferred path: the count is not known yet.
+        total_code_examples = outcome.get("code_examples", 0) if job_id is None else None
+        job_fields = (
+            {} if job_id is None
+            else {"job_id": job_id, "indexing": "queued", "follow": _follow_command(job_id)}
+        )
+
         # Query mode - perform RAG queries on all crawled URLs with parallel processing
         if query and len(query) > 0:
             results = {}
@@ -1535,9 +1494,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             "crawl_type": crawl_type,
             "pages_crawled": len(crawl_results),
             "chunks_stored": chunk_count,
-            "code_examples_stored": len(code_examples),
+            "code_examples_stored": total_code_examples,
             "sources_updated": len(source_content_map),
-            "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else [])
+            "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else []),
+            **job_fields
         }, indent=2)
     except Exception as e:
         return json.dumps({
@@ -3187,14 +3147,17 @@ def _follow_command(job_id: str) -> str:
     return f"curl -sN {base}/jobs/{job_id}/stream"
 
 
-async def _dispatch_indexing(work: Any, total: int) -> Optional[str]:
+async def _dispatch_indexing(work: Any, total: int, *, allow_defer: bool = True) -> Optional[str]:
     """Index now, or hand the work to a background job and return its id.
 
     Deferring is only worth its complexity when the work is long, which is
     exactly when contextual embeddings are on: each chunk costs an LLM call,
     and the caller would otherwise wait for all of them.
+
+    allow_defer=False is for a caller that reads back what it just indexed,
+    which would otherwise query an index that is not filled yet.
     """
-    if os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") != "true":
+    if not allow_defer or os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") != "true":
         await asyncio.to_thread(work, None)
         return None
 
@@ -3225,12 +3188,29 @@ async def _run_index_job(job_id: str, work: Any) -> None:
     other coroutine for as long as it runs, /health included.
     """
     start_index_job(job_id)
+    beat = asyncio.create_task(_beat_index_job(job_id))
     try:
         await asyncio.to_thread(work, job_id)
+        error = None
     except Exception as e:
-        finish_index_job(job_id, error=f"{type(e).__name__}: {e}")
-    else:
-        finish_index_job(job_id)
+        error = f"{type(e).__name__}: {e}"
+    finally:
+        beat.cancel()
+    finish_index_job(job_id, error=error)
+
+
+async def _beat_index_job(job_id: str) -> None:
+    """Touch the heartbeat on a timer for as long as the work runs.
+
+    The heartbeat attests that the process is alive, not that work advanced:
+    the indexing phase reports nothing for minutes at a stretch, and without
+    its own beat a healthy job goes quiet past INDEX_JOB_STALE_SECONDS and
+    reads as lost while it is still working. Progress is carried by `done`.
+    """
+    interval = float(os.getenv("INDEX_JOB_HEARTBEAT_SECONDS", "30"))
+    while True:
+        await asyncio.sleep(interval)
+        await asyncio.to_thread(bump_index_job, job_id)
 
 
 START_TIME = time.time()
@@ -3311,6 +3291,16 @@ async def _job_stream(request):
 async def main():
     # Default transport is Streamable HTTP (SSE is deprecated upstream).
     transport = os.getenv("TRANSPORT", "streamable-http")
+    # Before serving: /jobs/{id} would otherwise raise UndefinedTable, and
+    # answer 500 instead of the 404 an unknown id is owed, on any database
+    # that predates this table.
+    try:
+        ensure_index_jobs_table()
+        abandoned = abandon_orphaned_index_jobs()
+        if abandoned:
+            print(f"Abandoned {abandoned} indexing job(s) left by a previous process")
+    except Exception as e:
+        print(f"Could not prepare the index_jobs table: {e}")
     try:
         if transport == 'streamable-http':
             # Serves the MCP endpoint at streamable_http_path ("/mcp") plus the

@@ -130,6 +130,29 @@ def test_a_finished_job_with_a_stale_heartbeat_stays_done():
         _purge(job_id)
 
 
+def test_startup_abandons_jobs_left_behind_by_a_dead_process():
+    """The work to run lives in memory, so a job that outlives its process has
+    nobody left to run it. A queued job is never derived as lost either, so
+    without this it would sit there forever and its follower would never be
+    told."""
+    utils.ensure_index_jobs_table()
+    queued = utils.create_index_job(total=1)
+    running = utils.create_index_job(total=1)
+    finished = utils.create_index_job(total=1)
+    try:
+        utils.start_index_job(running)
+        utils.finish_index_job(finished)
+
+        utils.abandon_orphaned_index_jobs()
+
+        assert utils.get_index_job(queued)["state"] == "failed", "the queued job was left stranded"
+        assert utils.get_index_job(running)["state"] == "failed", "the running job was left stranded"
+        assert utils.get_index_job(finished)["state"] == "done", "a terminal job was rewritten"
+    finally:
+        for job_id in (queued, running, finished):
+            _purge(job_id)
+
+
 TESTS = [
     test_a_new_job_starts_queued_with_its_total,
     test_starting_a_job_marks_it_running_and_opens_a_heartbeat,
@@ -138,6 +161,7 @@ TESTS = [
     test_finishing_a_job_with_an_error_marks_it_failed,
     test_a_running_job_with_a_stale_heartbeat_reads_as_lost,
     test_a_finished_job_with_a_stale_heartbeat_stays_done,
+    test_startup_abandons_jobs_left_behind_by_a_dead_process,
 ]
 
 

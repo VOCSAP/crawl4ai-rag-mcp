@@ -85,6 +85,18 @@ def test_a_second_job_waits_when_only_one_slot_is_open():
                 _purge(job_id)
 
 
+def test_a_caller_that_reads_its_own_writes_indexes_inline():
+    """smart_crawl_url can run RAG queries over what it just crawled. Deferring
+    there would query an index that is not filled yet."""
+    os.environ["USE_CONTEXTUAL_EMBEDDINGS"] = "true"
+    done = []
+    job_id = asyncio.run(
+        mod._dispatch_indexing(lambda _j: done.append(1), total=3, allow_defer=False)
+    )
+    assert job_id is None, f"a job was created despite allow_defer=False: {job_id!r}"
+    assert done == [1], "the work had not run by the time the caller was answered"
+
+
 def test_the_follow_command_targets_the_configured_base_url():
     os.environ["INDEX_JOB_FOLLOW_BASE_URL"] = "https://rag.example.test"
     cmd = mod._follow_command("j-1")
@@ -96,6 +108,7 @@ TESTS = [
     test_without_contextual_embeddings_the_work_is_done_before_returning,
     test_with_contextual_embeddings_a_job_id_comes_back_before_the_work_ends,
     test_a_second_job_waits_when_only_one_slot_is_open,
+    test_a_caller_that_reads_its_own_writes_indexes_inline,
     test_the_follow_command_targets_the_configured_base_url,
 ]
 

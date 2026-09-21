@@ -72,8 +72,57 @@ def test_without_contextual_embeddings_nothing_changes_for_the_caller():
     assert body["success"] is True
 
 
+def _run_smart_crawl(query=None):
+    """Drive smart_crawl_url on a plain page, crawl and indexing stubbed."""
+    real_single, real_index = mod.crawl_markdown_file, mod._index_crawl_payload
+
+    async def _fake_single(crawler, url):
+        return [{"url": url, "markdown": PAGE}]
+
+    mod.crawl_markdown_file = _fake_single
+    mod._index_crawl_payload = lambda *a, **k: 0
+
+    class _Ctx:
+        class request_context:
+            class lifespan_context:
+                @staticmethod
+                async def get_crawler():
+                    return None
+
+    try:
+        raw = asyncio.run(mod.smart_crawl_url(_Ctx, "https://example.test/page.txt", query=query))
+    finally:
+        mod.crawl_markdown_file, mod._index_crawl_payload = real_single, real_index
+    return json.loads(raw)
+
+
+def test_smart_crawl_still_answers_after_the_indexing_moved_out():
+    """smart_crawl_url built its own reply from variables that lived in the
+    indexing block. Moving that block out must not leave a dangling name."""
+    os.environ["USE_CONTEXTUAL_EMBEDDINGS"] = "true"
+    body = _run_smart_crawl()
+    job_id = body.get("job_id")
+    try:
+        assert body.get("success") is True, f"smart_crawl_url failed: {body}"
+        assert "code_examples_stored" in body, f"field dropped from the answer: {sorted(body)}"
+    finally:
+        if job_id:
+            _purge(job_id)
+
+
+def test_smart_crawl_in_query_mode_indexes_before_it_searches():
+    os.environ["USE_CONTEXTUAL_EMBEDDINGS"] = "true"
+    body = _run_smart_crawl(query="anything")
+    assert "job_id" not in body, (
+        "query mode deferred the indexing, so it searched an index that is not "
+        "filled yet"
+    )
+
+
 TESTS = [
     test_with_contextual_embeddings_the_caller_gets_a_job_to_follow,
+    test_smart_crawl_still_answers_after_the_indexing_moved_out,
+    test_smart_crawl_in_query_mode_indexes_before_it_searches,
     test_without_contextual_embeddings_nothing_changes_for_the_caller,
 ]
 

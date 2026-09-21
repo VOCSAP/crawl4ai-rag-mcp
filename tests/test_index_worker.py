@@ -5,6 +5,7 @@ work itself is injected, so these tests need Postgres but neither Ollama nor a
 browser.
 """
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -102,8 +103,61 @@ def test_work_that_raises_ends_the_job_failed_with_its_message():
         _purge(job_id)
 
 
+def test_a_long_job_keeps_its_heartbeat_fresh_while_it_works():
+    """A heartbeat says the process is alive, not that work progressed. Without
+    one beating on its own, a healthy 19-minute job goes silent between two
+    step boundaries and reads as lost long before it ends."""
+    utils.ensure_index_jobs_table()
+    os.environ["INDEX_JOB_STALE_SECONDS"] = "1"
+    os.environ["INDEX_JOB_HEARTBEAT_SECONDS"] = "0.2"
+    job_id = utils.create_index_job(total=1)
+    seen = []
+
+    def _long_quiet_work(_job_id):
+        # Reports nothing, exactly like add_documents_to_db does today.
+        time.sleep(2.5)
+
+    async def _watch():
+        for _ in range(12):
+            await asyncio.sleep(0.2)
+            seen.append(utils.get_index_job(job_id)["state"])
+
+    async def _both():
+        await asyncio.gather(mod._run_index_job(job_id, _long_quiet_work), _watch())
+
+    try:
+        asyncio.run(_both())
+        assert "lost" not in seen, (
+            f"a healthy job was declared lost while still working: {seen}"
+        )
+        assert utils.get_index_job(job_id)["state"] == "done"
+    finally:
+        os.environ.pop("INDEX_JOB_STALE_SECONDS", None)
+        os.environ.pop("INDEX_JOB_HEARTBEAT_SECONDS", None)
+        _purge(job_id)
+
+
+def test_chunks_that_lost_their_context_are_counted_on_the_job():
+    """A chunk whose LLM context call fails is still indexed, as its raw self.
+    Silently reporting zero failures would hide a degraded index."""
+    utils.ensure_index_jobs_table()
+    job_id = utils.create_index_job(total=5)
+    real = mod.add_documents_to_db
+    mod.add_documents_to_db = lambda *a, **k: 2
+    try:
+        mod._index_crawl_payload(job_id, {}, {}, ["u"], [0], ["c"] * 5, [{}] * 5, {}, [], 20)
+        job = utils.get_index_job(job_id)
+        assert job["failed"] == 2, f"expected 2 degraded chunks, job reports {job['failed']}"
+        assert job["done"] == 5, f"expected 5 indexed chunks, job reports {job['done']}"
+    finally:
+        mod.add_documents_to_db = real
+        _purge(job_id)
+
+
 TESTS = [
     test_running_a_job_leaves_the_event_loop_free,
+    test_chunks_that_lost_their_context_are_counted_on_the_job,
+    test_a_long_job_keeps_its_heartbeat_fresh_while_it_works,
     test_a_completed_job_ends_done,
     test_work_that_raises_ends_the_job_failed_with_its_message,
 ]
