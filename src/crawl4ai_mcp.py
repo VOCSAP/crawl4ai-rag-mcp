@@ -119,34 +119,60 @@ def validate_github_url(repo_url: str) -> Dict[str, Any]:
     
     return {"valid": True, "repo_name": repo_url.split('/')[-1].replace('.git', '')}
 
+# Process-wide Chromium singleton, mirroring _get_local_reranker below.
+#
+# crawl4ai_lifespan is re-entered once per MCP session, so a crawler owned by the
+# per-session context starts one Chromium process tree (~10 processes) per
+# session. Its only teardown would be the lifespan finally, which anyio TaskGroup
+# cancellation bypasses on abrupt disconnect -- the orphaned trees then pile up
+# until the container hits its cgroup limit with a surviving PID 1, so
+# `restart: unless-stopped` never fires. See KNOWN_ISSUES.md section VII.
+#
+# Building asyncio.Lock() at import time is safe on Python >= 3.10: the loop is
+# bound on first await, not in __init__.
+_shared_crawler: Optional[AsyncWebCrawler] = None
+_shared_crawler_lock = asyncio.Lock()
+
+
+async def _get_shared_crawler() -> AsyncWebCrawler:
+    """Start the Chromium crawler once per process, shared by every MCP session."""
+    global _shared_crawler
+    if _shared_crawler is not None:
+        return _shared_crawler
+    async with _shared_crawler_lock:
+        if _shared_crawler is None:
+            browser_config = BrowserConfig(headless=True, verbose=False)
+            crawler = AsyncWebCrawler(config=browser_config)
+            await crawler.__aenter__()
+            _shared_crawler = crawler
+            print("Crawler started (lazy init, process-wide singleton)")
+    return _shared_crawler
+
+
+async def _close_shared_crawler() -> None:
+    """Tear down the shared Chromium. Process shutdown only, never per session."""
+    global _shared_crawler
+    crawler, _shared_crawler = _shared_crawler, None
+    if crawler is None:
+        return
+    try:
+        await crawler.__aexit__(None, None, None)
+        print("Crawler closed")
+    except Exception as e:
+        print(f"Error closing shared crawler: {e}")
+
+
 # Create a dataclass for our application context
 @dataclass
 class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
-    _crawler: Optional[AsyncWebCrawler] = None
-    _crawler_lock: Optional[asyncio.Lock] = None
     reranking_model: Optional[Any] = None
     knowledge_validator: Optional[Any] = None
     repo_extractor: Optional[Any] = None
 
     async def get_crawler(self) -> AsyncWebCrawler:
-        """Return the crawler, starting it lazily on first call."""
-        if self._crawler is not None:
-            return self._crawler
-        if self._crawler_lock is None:
-            self._crawler_lock = asyncio.Lock()
-        async with self._crawler_lock:
-            if self._crawler is None:
-                browser_config = BrowserConfig(headless=True, verbose=False)
-                self._crawler = AsyncWebCrawler(config=browser_config)
-                await self._crawler.__aenter__()
-                print("Crawler started (lazy init)")
-        return self._crawler
-
-    async def close_crawler(self):
-        if self._crawler is not None:
-            await self._crawler.__aexit__(None, None, None)
-            self._crawler = None
+        """Return the process-wide crawler, starting it lazily on first call."""
+        return await _get_shared_crawler()
 
 @functools.cache
 def _get_local_reranker(model_name: str) -> Any:
@@ -237,7 +263,9 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     try:
         yield ctx
     finally:
-        await ctx.close_crawler()
+        # The Chromium crawler is deliberately NOT closed here: it is shared by
+        # every session, so one disconnect would kill the browser another session
+        # is mid-crawl on. _close_shared_crawler runs at process shutdown.
         if knowledge_validator:
             try:
                 await knowledge_validator.close()
@@ -3105,19 +3133,23 @@ async def _health(request):
 async def main():
     # Default transport is Streamable HTTP (SSE is deprecated upstream).
     transport = os.getenv("TRANSPORT", "streamable-http")
-    if transport == 'streamable-http':
-        # Serves the MCP endpoint at streamable_http_path ("/mcp") plus the
-        # /health custom route. run_streamable_http_async builds the Starlette
-        # app (session-manager lifespan included) and serves it via uvicorn.
-        await mcp.run_streamable_http_async()
-    elif transport == 'sse':
-        # Legacy fallback for older clients. Best-effort: the SSE init-race
-        # monkey-patch was removed with the SDK upgrade, so the Claude Code
-        # init race may resurface here. Prefer streamable-http.
-        await mcp.run_sse_async()
-    else:
-        # Run the MCP server with stdio transport.
-        await mcp.run_stdio_async()
+    try:
+        if transport == 'streamable-http':
+            # Serves the MCP endpoint at streamable_http_path ("/mcp") plus the
+            # /health custom route. run_streamable_http_async builds the Starlette
+            # app (session-manager lifespan included) and serves it via uvicorn.
+            await mcp.run_streamable_http_async()
+        elif transport == 'sse':
+            # Legacy fallback for older clients. Best-effort: the SSE init-race
+            # monkey-patch was removed with the SDK upgrade, so the Claude Code
+            # init race may resurface here. Prefer streamable-http.
+            await mcp.run_sse_async()
+        else:
+            # Run the MCP server with stdio transport.
+            await mcp.run_stdio_async()
+    finally:
+        # Same event loop that started Chromium, so __aexit__ can reach it.
+        await _close_shared_crawler()
 
 if __name__ == "__main__":
     asyncio.run(main())
