@@ -53,7 +53,6 @@ from utils import (
     start_index_job,
     bump_index_job,
     finish_index_job,
-    claim_next_index_job,
 )
 
 # Import knowledge graph modules
@@ -3122,6 +3121,55 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     return results_all
 
 # --- Asynchronous indexing worker -----------------------------------------
+
+
+# A task created with create_task and not referenced anywhere can be collected
+# mid-flight, so background jobs are held here until they finish.
+_BACKGROUND_INDEX_TASKS: set = set()
+_INDEX_SLOTS: Optional[asyncio.Semaphore] = None
+_INDEX_SLOTS_SIZE = 0
+
+
+def _index_slots() -> asyncio.Semaphore:
+    """Bound concurrent indexing jobs, rebuilt when the setting changes."""
+    global _INDEX_SLOTS, _INDEX_SLOTS_SIZE
+    size = max(1, int(os.getenv("INDEX_JOB_CONCURRENCY", "1")))
+    if _INDEX_SLOTS is None or size != _INDEX_SLOTS_SIZE:
+        _INDEX_SLOTS = asyncio.Semaphore(size)
+        _INDEX_SLOTS_SIZE = size
+    return _INDEX_SLOTS
+
+
+def _follow_command(job_id: str) -> str:
+    """The command the caller can run to watch this job through to the end."""
+    base = os.getenv("INDEX_JOB_FOLLOW_BASE_URL", "http://localhost:8051").rstrip("/")
+    return f"curl -sN {base}/jobs/{job_id}/stream"
+
+
+async def _dispatch_indexing(work: Any, total: int) -> Optional[str]:
+    """Index now, or hand the work to a background job and return its id.
+
+    Deferring is only worth its complexity when the work is long, which is
+    exactly when contextual embeddings are on: each chunk costs an LLM call,
+    and the caller would otherwise wait for all of them.
+    """
+    if os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") != "true":
+        await asyncio.to_thread(work, None)
+        return None
+
+    ensure_index_jobs_table()
+    job_id = create_index_job(total)
+
+    async def _guarded() -> None:
+        # Acquired before the job is marked running, so a job waiting for a
+        # slot stays visibly queued.
+        async with _index_slots():
+            await _run_index_job(job_id, work)
+
+    task = asyncio.create_task(_guarded())
+    _BACKGROUND_INDEX_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_INDEX_TASKS.discard)
+    return job_id
 
 
 async def _run_index_job(job_id: str, work: Any) -> None:

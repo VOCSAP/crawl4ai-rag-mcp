@@ -1130,12 +1130,6 @@ _LIVE_STATE_SQL = """
          THEN 'lost' ELSE state END
 """
 
-_ACTIVE_COUNT_SQL = """
-    SELECT count(*) FROM index_jobs
-     WHERE state = 'running'
-       AND heartbeat_at > now() - make_interval(secs => %s)
-"""
-
 
 def get_index_job(job_id: str, *, conn=None) -> Optional[Dict[str, Any]]:
     """Return the job as a dict, or None when the id is unknown."""
@@ -1157,40 +1151,3 @@ def get_index_job(job_id: str, *, conn=None) -> Optional[Dict[str, Any]]:
     return job
 
 
-def count_active_index_jobs(*, conn=None) -> int:
-    """Count jobs genuinely being worked on, so a dead worker frees its slot."""
-    with _conn_or_pool(conn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(_ACTIVE_COUNT_SQL, (_index_job_stale_seconds(),))
-            return cur.fetchone()[0]
-
-
-def claim_next_index_job(max_active: int, *, conn=None) -> Optional[str]:
-    """Move the oldest queued job to running, unless max_active is reached.
-
-    The count and the claim share one transaction, so two workers cannot both
-    see a free slot and take it. SKIP LOCKED keeps them from claiming the same
-    row.
-    """
-    stale = _index_job_stale_seconds()
-    with _conn_or_pool(conn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(_ACTIVE_COUNT_SQL, (stale,))
-            if cur.fetchone()[0] >= max_active:
-                conn.rollback()
-                return None
-            cur.execute(
-                """
-                UPDATE index_jobs
-                   SET state = 'running', started_at = now(), heartbeat_at = now()
-                 WHERE id = (SELECT id FROM index_jobs
-                              WHERE state = 'queued'
-                              ORDER BY created_at
-                                FOR UPDATE SKIP LOCKED
-                              LIMIT 1)
-                RETURNING id
-                """
-            )
-            row = cur.fetchone()
-        conn.commit()
-    return str(row[0]) if row else None

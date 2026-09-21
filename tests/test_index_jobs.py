@@ -130,39 +130,6 @@ def test_a_finished_job_with_a_stale_heartbeat_stays_done():
         _purge(job_id)
 
 
-def test_claiming_stops_at_the_concurrency_limit():
-    utils.ensure_index_jobs_table()
-    a = utils.create_index_job(total=1)
-    b = utils.create_index_job(total=1)
-    try:
-        # Measured rather than assumed: the table may already hold running jobs.
-        limit = utils.count_active_index_jobs() + 1
-        first = utils.claim_next_index_job(limit)
-        assert first in (a, b), f"expected one of the queued jobs, got {first!r}"
-        second = utils.claim_next_index_job(limit)
-        assert second is None, f"claimed {second!r} while already at the limit"
-    finally:
-        _purge(a)
-        _purge(b)
-
-
-def test_a_lost_job_frees_its_concurrency_slot():
-    utils.ensure_index_jobs_table()
-    stuck = utils.create_index_job(total=1)
-    waiting = utils.create_index_job(total=1)
-    try:
-        limit = utils.count_active_index_jobs() + 1
-        assert utils.claim_next_index_job(limit) == stuck
-        _age_heartbeat(stuck, 10 * 60)
-        assert utils.claim_next_index_job(limit) == waiting, (
-            "a job whose worker died still holds its slot, so the queue is "
-            "blocked until the table is cleaned by hand"
-        )
-    finally:
-        _purge(stuck)
-        _purge(waiting)
-
-
 TESTS = [
     test_a_new_job_starts_queued_with_its_total,
     test_starting_a_job_marks_it_running_and_opens_a_heartbeat,
@@ -171,8 +138,6 @@ TESTS = [
     test_finishing_a_job_with_an_error_marks_it_failed,
     test_a_running_job_with_a_stale_heartbeat_reads_as_lost,
     test_a_finished_job_with_a_stale_heartbeat_stays_done,
-    test_claiming_stops_at_the_concurrency_limit,
-    test_a_lost_job_frees_its_concurrency_slot,
 ]
 
 
