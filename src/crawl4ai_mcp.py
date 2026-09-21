@@ -3160,6 +3160,65 @@ async def _health(request):
     return JSONResponse({"status": "ok", "uptime_s": int(time.time() - START_TIME)})
 
 
+_TERMINAL_JOB_STATES = ("done", "failed", "lost")
+
+
+def _job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    """JSON-safe view of a job: counters and state only, no crawled content."""
+    payload = {k: job[k] for k in ("id", "state", "total", "done", "failed", "error")}
+    for k in ("created_at", "started_at", "finished_at", "heartbeat_at"):
+        value = job.get(k)
+        payload[k] = value.isoformat() if value else None
+    return payload
+
+
+@mcp.custom_route("/jobs/{job_id}", methods=["GET"])
+async def _job_status(request):
+    """Point-in-time state of an indexing job."""
+    from starlette.responses import JSONResponse
+    job = await asyncio.to_thread(get_index_job, request.path_params["job_id"])
+    if job is None:
+        return JSONResponse({"error": "unknown job"}, status_code=404)
+    return JSONResponse(_job_payload(job))
+
+
+async def _stream_job_progress(job_id: str):
+    """Yield one JSON line per change, plus a keep-alive when nothing moves.
+
+    The keep-alive is what lets the follow survive a reverse proxy: nginx
+    closes a proxied connection after a delay without a single byte, and that
+    delay is counted between reads rather than over the whole request. A
+    19-minute job is therefore fine as long as it never goes quiet.
+    """
+    poll = float(os.getenv("INDEX_JOB_STREAM_POLL_SECONDS", "0.5"))
+    keepalive = float(os.getenv("INDEX_JOB_STREAM_KEEPALIVE_SECONDS", "10"))
+    last_payload = None
+    last_emit = 0.0
+    while True:
+        job = await asyncio.to_thread(get_index_job, job_id)
+        if job is None:
+            return
+        payload = _job_payload(job)
+        now = time.monotonic()
+        if payload != last_payload or now - last_emit >= keepalive:
+            yield json.dumps(payload) + "\n"
+            last_payload = payload
+            last_emit = now
+        if job["state"] in _TERMINAL_JOB_STATES:
+            return
+        await asyncio.sleep(poll)
+
+
+@mcp.custom_route("/jobs/{job_id}/stream", methods=["GET"])
+async def _job_stream(request):
+    """Follow a job until it ends. Meant to be held open by curl."""
+    from starlette.responses import JSONResponse, StreamingResponse
+    job_id = request.path_params["job_id"]
+    if await asyncio.to_thread(get_index_job, job_id) is None:
+        return JSONResponse({"error": "unknown job"}, status_code=404)
+    return StreamingResponse(_stream_job_progress(job_id), media_type="application/x-ndjson")
+
+
 async def main():
     # Default transport is Streamable HTTP (SSE is deprecated upstream).
     transport = os.getenv("TRANSPORT", "streamable-http")
