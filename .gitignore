@@ -20,7 +20,10 @@ findings.md
 progress.md
 crawl4ai-rag-mcp-plan.md
 .planning/
-tests/
+# tests/* rather than tests/: git cannot re-include a file whose parent
+# directory is excluded, and regression tests are code that must ship.
+tests/*
+!tests/test_crawler_singleton.py
 test_agentic.py
 KNOWN_ISSUES.md
 .kleos-space
