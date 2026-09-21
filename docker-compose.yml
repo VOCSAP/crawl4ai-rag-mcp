@@ -69,6 +69,7 @@ services:
       # baked /app/hf_cache with an empty dir and break offline rerank.
     mem_limit: 2560m
     memswap_limit: 3g      
+    pids_limit: 512
     logging:
       driver: "json-file"
       options:
