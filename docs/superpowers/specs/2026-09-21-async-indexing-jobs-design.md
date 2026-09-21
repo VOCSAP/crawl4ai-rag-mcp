@@ -176,9 +176,14 @@ requetes concurrentes, et le goulot se deplace de la RAM du container vers le GP
 **Augmenter la RAM de l'hote ne suffit pas.** Le container est cappe par `docker-compose.yml` a
 `mem_limit: 2560m` et `memswap_limit: 3g`, soit environ 512 Mo de swap effectif, contrairement aux trois
 autres services de la stack ou `memswap_limit` egale `mem_limit`. Monter `INDEX_JOB_CONCURRENCY` sans
-monter `mem_limit` reproduit l'incident du 2026-09-21. Et comme le
-`MemoryAdaptiveDispatcher` de crawl4ai lit `/proc/meminfo` et non le cgroup (mesure en section VII de
-`KNOWN_ISSUES.md`), il verra la RAM de l'hote et ne freinera jamais.
+monter `mem_limit` reproduit l'incident du 2026-09-21.
+
+Aucun garde-fou ne rattrapera l'erreur. Le `MemoryAdaptiveDispatcher` de crawl4ai lit
+`/proc/meminfo` et non le cgroup. Mesure du 2026-09-21 depuis l'interieur du container :
+`MemTotal: 26465404 kB`, soit 25.24 GiB. Son seuil de 70 % vaut donc 17.67 GiB, environ **sept fois**
+le `mem_limit` de 2.5 GiB que le cgroup applique reellement. Il ne peut jamais freiner avant l'OOM
+kill, et il peut a l'inverse freiner des crawls a cause de processus etrangers au container. Detail
+en section VII de `KNOWN_ISSUES.md`.
 
 Ces valeurs sont lues a l'import : les ajuster demande `docker compose up -d`, jamais `restart`.
 
