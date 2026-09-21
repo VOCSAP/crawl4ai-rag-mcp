@@ -47,6 +47,13 @@ from utils import (
     get_all_sources,
     keyword_search_crawled_pages,
     keyword_search_code_examples,
+    ensure_index_jobs_table,
+    create_index_job,
+    get_index_job,
+    start_index_job,
+    bump_index_job,
+    finish_index_job,
+    claim_next_index_job,
 )
 
 # Import knowledge graph modules
@@ -3113,6 +3120,29 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
         current_urls = next_level_urls
 
     return results_all
+
+# --- Asynchronous indexing worker -----------------------------------------
+
+
+async def _run_index_job(job_id: str, work: Any) -> None:
+    """Run one indexing job off the event loop and record how it ended.
+
+    `work` is a synchronous callable taking the job id. Injecting it keeps the
+    job lifecycle here and leaves what indexing means to the caller.
+
+    asyncio.to_thread is the whole point: the indexing pipeline is synchronous
+    end to end (LLM calls through the openai client, then a ThreadPoolExecutor
+    whose with-block waits on every future), so calling it inline starves every
+    other coroutine for as long as it runs, /health included.
+    """
+    start_index_job(job_id)
+    try:
+        await asyncio.to_thread(work, job_id)
+    except Exception as e:
+        finish_index_job(job_id, error=f"{type(e).__name__}: {e}")
+    else:
+        finish_index_job(job_id)
+
 
 START_TIME = time.time()
 
