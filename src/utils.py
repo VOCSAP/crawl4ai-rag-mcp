@@ -15,6 +15,7 @@ from psycopg2 import pool as _pg_pool
 import openai
 import re
 import time
+import uuid
 
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
 
@@ -1019,3 +1020,177 @@ def keyword_search_code_examples(
     except Exception as e:
         print(f"Error in keyword search (code_examples): {e}")
         return []
+
+
+# --- Asynchronous indexing jobs -------------------------------------------
+
+_INDEX_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS index_jobs (
+    id            uuid PRIMARY KEY,
+    state         text NOT NULL,
+    total         integer NOT NULL DEFAULT 0,
+    done          integer NOT NULL DEFAULT 0,
+    failed        integer NOT NULL DEFAULT 0,
+    error         text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    started_at    timestamptz,
+    finished_at   timestamptz,
+    heartbeat_at  timestamptz
+)
+"""
+
+
+def ensure_index_jobs_table(*, conn=None) -> None:
+    """Create the index_jobs table if it is absent.
+
+    crawled_pages.sql only runs on a first `up`, through
+    docker-entrypoint-initdb.d, so a deployment onto an existing volume would
+    never see this table. The server calls this at startup instead.
+    """
+    with _conn_or_pool(conn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(_INDEX_JOBS_DDL)
+        conn.commit()
+
+
+def create_index_job(total: int, *, conn=None) -> str:
+    """Record a queued indexing job covering `total` chunks, and return its id."""
+    # uuid4 is generated here rather than by gen_random_uuid(), which needs
+    # either Postgres 13+ or the pgcrypto extension.
+    job_id = str(uuid.uuid4())
+    with _conn_or_pool(conn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO index_jobs (id, state, total) VALUES (%s, 'queued', %s)",
+                (job_id, total),
+            )
+        conn.commit()
+    return job_id
+
+
+def start_index_job(job_id: str, *, conn=None) -> None:
+    """Move a queued job to running and open its heartbeat."""
+    with _conn_or_pool(conn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE index_jobs
+                   SET state = 'running', started_at = now(), heartbeat_at = now()
+                 WHERE id = %s
+                """,
+                (job_id,),
+            )
+        conn.commit()
+
+
+def bump_index_job(job_id: str, done_delta: int = 0, failed_delta: int = 0, *, conn=None) -> None:
+    """Record progress on a running job and touch its heartbeat.
+
+    The heartbeat is what tells a reader the worker is still alive, so it is
+    touched on every unit of work rather than on a timer.
+    """
+    with _conn_or_pool(conn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE index_jobs
+                   SET done = done + %s, failed = failed + %s, heartbeat_at = now()
+                 WHERE id = %s
+                """,
+                (done_delta, failed_delta, job_id),
+            )
+        conn.commit()
+
+
+def finish_index_job(job_id: str, error: Optional[str] = None, *, conn=None) -> None:
+    """Close a job, as failed when `error` is given and as done otherwise."""
+    with _conn_or_pool(conn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE index_jobs
+                   SET state = %s, error = %s, finished_at = now(), heartbeat_at = now()
+                 WHERE id = %s
+                """,
+                ("failed" if error else "done", error, job_id),
+            )
+        conn.commit()
+
+
+def _index_job_stale_seconds() -> int:
+    return int(os.getenv("INDEX_JOB_STALE_SECONDS", "300"))
+
+
+# 'lost' is derived at read time rather than written: a worker killed by the
+# OOM reaper cannot record its own final state, so the absence of a fresh
+# heartbeat is the only evidence available.
+_LIVE_STATE_SQL = """
+    CASE WHEN state = 'running'
+          AND heartbeat_at < now() - make_interval(secs => %s)
+         THEN 'lost' ELSE state END
+"""
+
+_ACTIVE_COUNT_SQL = """
+    SELECT count(*) FROM index_jobs
+     WHERE state = 'running'
+       AND heartbeat_at > now() - make_interval(secs => %s)
+"""
+
+
+def get_index_job(job_id: str, *, conn=None) -> Optional[Dict[str, Any]]:
+    """Return the job as a dict, or None when the id is unknown."""
+    with _conn_or_pool(conn) as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT id, total, done, failed, error, created_at, started_at,
+                       finished_at, heartbeat_at, {_LIVE_STATE_SQL} AS state
+                  FROM index_jobs WHERE id = %s
+                """,
+                (_index_job_stale_seconds(), job_id),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    job = dict(row)
+    job["id"] = str(job["id"])
+    return job
+
+
+def count_active_index_jobs(*, conn=None) -> int:
+    """Count jobs genuinely being worked on, so a dead worker frees its slot."""
+    with _conn_or_pool(conn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(_ACTIVE_COUNT_SQL, (_index_job_stale_seconds(),))
+            return cur.fetchone()[0]
+
+
+def claim_next_index_job(max_active: int, *, conn=None) -> Optional[str]:
+    """Move the oldest queued job to running, unless max_active is reached.
+
+    The count and the claim share one transaction, so two workers cannot both
+    see a free slot and take it. SKIP LOCKED keeps them from claiming the same
+    row.
+    """
+    stale = _index_job_stale_seconds()
+    with _conn_or_pool(conn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(_ACTIVE_COUNT_SQL, (stale,))
+            if cur.fetchone()[0] >= max_active:
+                conn.rollback()
+                return None
+            cur.execute(
+                """
+                UPDATE index_jobs
+                   SET state = 'running', started_at = now(), heartbeat_at = now()
+                 WHERE id = (SELECT id FROM index_jobs
+                              WHERE state = 'queued'
+                              ORDER BY created_at
+                                FOR UPDATE SKIP LOCKED
+                              LIMIT 1)
+                RETURNING id
+                """
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return str(row[0]) if row else None
