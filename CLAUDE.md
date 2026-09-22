@@ -67,3 +67,17 @@ Conception complète et alternatives écartées : `docs/superpowers/specs/2026-0
 `mcp` pousse la docstring d'un outil VERBATIM comme sa description (`func_doc = description or fn.__doc__`, `mcp/server/fastmcp/tools/base.py`). Aucun parsing n'a lieu : un bloc `Args:` n'alimente jamais les descriptions par paramètre du schéma JSON, c'est de la prose facturée à chaque client, à chaque session. Écrire les docstrings en conséquence : une première phrase qui dit quoi et quand, les arbitrages entre outils voisins, les contraintes non devinables, et rien qui soit déjà porté par le nom, le type ou le défaut d'un paramètre.
 
 Les 3 outils Neo4j (`query_knowledge_graph`, `check_ai_script_hallucinations`, `parse_github_repository`) ne sont enregistrés que si `USE_KNOWLEDGE_GRAPH=true`, via le décorateur `_knowledge_graph_tool()`. Aucun service Neo4j n'existe dans `docker-compose.yml`, donc ils ne faisaient que retourner leur erreur « disabled » tout en coûtant leur description. Quand la variable est à `false`, la fonction non décorée reste liée dans le namespace du module : basculer la variable suffit à les réexposer. La valeur est lue à l'import, donc propager un changement de `.env` avec `docker compose up -d`, jamais `restart`.
+
+## Agent skills
+
+### Issue tracker
+
+Les issues vivent dans la roadmap partagée claude-peers (outils MCP `roadmap_*`) ; les GitHub Issues sont désactivées sur ce fork. Voir `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Mapping identité sur les cinq rôles canoniques, portés par le champ `triage` des cartes de roadmap. Voir `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context : un `CONTEXT.md` à la racine plus `docs/adr/`. Voir `docs/agents/domain.md`.
