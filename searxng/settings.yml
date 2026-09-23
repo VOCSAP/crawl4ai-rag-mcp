@@ -93,10 +93,6 @@ engines:
     engine: github
     shortcut: gh
     
-  - name: reddit
-    engine: reddit
-    shortcut: re
-    
   - name: arxiv
     engine: arxiv
     shortcut: arx
