@@ -569,14 +569,15 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
         params = {
             "q": query,
             "format": "json",
-            "categories": "general",
             "limit": num_results  # SearXNG uses 'limit'
         }
-        
-        # Add engines if specified
+
+        # A category next to engines would widen the selection to their union.
         if default_engines:
             params["engines"] = default_engines
-        
+        else:
+            params["categories"] = "general"
+
         print(f"Making SearXNG request to: {search_endpoint}")
         print(f"Parameters: {params}")
         
@@ -623,10 +624,12 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
         # Extract results from response
         results = search_data.get("results", [])
         if not results:
+            report = _searxng_engine_report(search_data, 0)
             return json.dumps({
                 "success": False,
                 "query": query,
-                "error": "No search results returned from SearXNG"
+                "error": report.pop("warning", "No search results returned from SearXNG"),
+                **report,
             }, indent=2)
         
         # Step 4: URL filtering - limit to num_results and validate URLs
@@ -1945,12 +1948,15 @@ def _searxng_request(query: str, categories: str, engines: str = None,
     params = {
         "q": query,
         "format": "json",
-        "categories": categories,
         "pageno": pageno,
         "limit": num_results,
     }
+    # SearXNG queries the union of the category engines and the engines list,
+    # so a category next to engines would defeat the filter.
     if engines:
         params["engines"] = engines
+    else:
+        params["categories"] = categories
     if language:
         params["language"] = language
 
@@ -1973,6 +1979,24 @@ def _searxng_request(query: str, categories: str, engines: str = None,
         return {"success": False, "error": f"SearXNG HTTP error: {e}"}
     except Exception as e:
         return {"success": False, "error": f"SearXNG request failed: {str(e)}"}
+
+
+def _searxng_engine_report(data: dict, result_count: int) -> dict:
+    """Turn SearXNG's unresponsive_engines pairs into fields for a tool answer.
+
+    Adds a warning when nothing came back and some engines failed, so a caller
+    does not read a blocked engine as an absence of pages.
+    """
+    unresponsive = [
+        {"engine": pair[0], "reason": pair[1] if len(pair) > 1 else ""}
+        for pair in data.get("unresponsive_engines") or []
+        if pair
+    ]
+    report = {"unresponsive_engines": unresponsive}
+    if result_count == 0 and unresponsive:
+        failed = ", ".join(f"{e['engine']} ({e['reason']})" for e in unresponsive)
+        report["warning"] = f"No results, and these engines failed: {failed}"
+    return report
 
 
 @mcp.tool()
@@ -2013,6 +2037,7 @@ async def searxng_search(ctx: Context, query: str, categories: str = "general",
         "categories": categories,
         "results": results,
         "count": len(results),
+        **_searxng_engine_report(data, len(results)),
     }, indent=2)
 
 
@@ -2049,6 +2074,7 @@ async def searxng_images(ctx: Context, query: str, engines: str = None,
         "query": query,
         "results": results,
         "count": len(results),
+        **_searxng_engine_report(data, len(results)),
     }, indent=2)
 
 
@@ -2086,6 +2112,7 @@ async def searxng_news(ctx: Context, query: str, engines: str = None,
         "query": query,
         "results": results,
         "count": len(results),
+        **_searxng_engine_report(data, len(results)),
     }, indent=2)
 
 
