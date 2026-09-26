@@ -5,7 +5,7 @@ description = "MCP server for integrating web crawling and RAG into AI agents an
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "crawl4ai==0.9.0",
+    "crawl4ai==0.9.4",
     "mcp==1.27.2",
     "psycopg2-binary>=2.9",
     "openai>=2.8,<3",

@@ -4,7 +4,7 @@
 
 > **(FORKED FROM https://github.com/coleam00/mcp-crawl4ai-rag). Added SearXNG integration and batch scrape and processing capabilities.**
 
-A **self-contained Docker solution** that combines the [Model Context Protocol (MCP)](https://modelcontextprotocol.io), [Crawl4AI](https://crawl4ai.com) (v0.9.0), [SearXNG](https://github.com/searxng/searxng), and a bundled **Postgres + pgvector** vector store to provide AI agents and coding assistants with complete web **search, crawling, and RAG capabilities**. This fork runs 100% locally: embeddings and LLM calls target an OpenAI-compatible endpoint (default: a local [Ollama](https://ollama.com/) instance), with no external cloud service required.
+A **self-contained Docker solution** that combines the [Model Context Protocol (MCP)](https://modelcontextprotocol.io), [Crawl4AI](https://crawl4ai.com) (v0.9.4), [SearXNG](https://github.com/searxng/searxng), and a bundled **Postgres + pgvector** vector store to provide AI agents and coding assistants with complete web **search, crawling, and RAG capabilities**. This fork runs 100% locally: embeddings and LLM calls target an OpenAI-compatible endpoint (default: a local [Ollama](https://ollama.com/) instance), with no external cloud service required.
 
 **🚀 Complete Stack in One Command**: Deploy everything with `docker compose up -d` - no Python setup, no dependencies, no external services required.
 

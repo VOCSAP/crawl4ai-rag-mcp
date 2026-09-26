@@ -2236,7 +2236,7 @@ async def get_markdown(ctx: Context, url: str, filter_mode: str = "fit",
         query: Required for bm25, ignored otherwise
     """
     try:
-        from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter, BM25ContentFilter
+        from crawl4ai import DefaultMarkdownGenerator, PruningContentFilterLXML, BM25ContentFilter
 
         mode = (filter_mode or "fit").lower()
         if mode not in ("fit", "raw", "bm25"):
@@ -2248,7 +2248,7 @@ async def get_markdown(ctx: Context, url: str, filter_mode: str = "fit",
 
         content_filter = None
         if mode == "fit":
-            content_filter = PruningContentFilter()
+            content_filter = PruningContentFilterLXML()
         elif mode == "bm25":
             content_filter = BM25ContentFilter(user_query=query)
         md_generator = DefaultMarkdownGenerator(content_filter=content_filter)
