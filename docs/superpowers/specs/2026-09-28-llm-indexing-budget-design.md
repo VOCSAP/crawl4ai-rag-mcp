@@ -154,23 +154,25 @@ Défauts provisoires : à 31 s par appel (mesure du 2026-09-21) et 2 workers, 30
 
 But : trouver le plus petit modèle qui garde l'essentiel du **gain de retrieval** apporté par `qwen3:8b`, et mesurer son coût CPU.
 
-- [ ] **Préalable opérateur** : relever le CPU de l'hôte Proxmox (`lscpu` : modèle, cœurs physiques, threads). D'après la mention d'un iGPU Radeon 760M, ce serait un Ryzen 5 à 6 cœurs : à confirmer, car 4 à 6 cœurs dédiés pèseraient lourd face à OPNsense.
-- [ ] **Moteur** : `llama-server` (llama.cpp), qui expose l'API OpenAI et règle explicitement `--threads`, `--parallel` et `--cache-reuse`. C'est aussi le candidat de la phase 5, donc on mesure ce qu'on déploiera. Ollama en mode CPU reste une alternative si `llama-server` pose problème sous Windows.
-- [ ] **Corpus** : une dizaine de pages variées (une très grosse doc de référence type `fs.html`, une doc Python, une page en français, un blog, la doc crawl4ai), récupérées en markdown brut (`get_markdown` ou `scrape_urls(return_raw_markdown=true)`) et découpées avec `smart_chunk_markdown` du projet. Échantillon d'environ 60 chunks. Scripts dans `bench/contextual/`, données dans `bench/contextual/data/` (gitignoré).
-- [ ] **Questions** : une question par chunk, générée à partir du chunk **brut** (jamais du contexte, pour ne pas biaiser en faveur d'un modèle), par un modèle fort indépendant des candidats. Relecture rapide d'un échantillon.
+- [x] **Préalable opérateur** : relever le CPU de l'hôte Proxmox (`lscpu` : modèle, cœurs physiques, threads). D'après la mention d'un iGPU Radeon 760M, ce serait un Ryzen 5 à 6 cœurs : à confirmer, car 4 à 6 cœurs dédiés pèseraient lourd face à OPNsense.
+- [x] **Moteur** : `llama-server` (llama.cpp), qui expose l'API OpenAI et règle explicitement `--threads`, `--parallel` et `--cache-reuse`. C'est aussi le candidat de la phase 5, donc on mesure ce qu'on déploiera. Ollama en mode CPU reste une alternative si `llama-server` pose problème sous Windows.
+- [x] **Corpus** : une dizaine de pages variées (une très grosse doc de référence type `fs.html`, une doc Python, une page en français, un blog, la doc crawl4ai), récupérées en markdown brut (`get_markdown` ou `scrape_urls(return_raw_markdown=true)`) et découpées avec `smart_chunk_markdown` du projet. Échantillon d'environ 60 chunks. Scripts dans `bench/contextual/`, données dans `bench/contextual/data/` (gitignoré).
+- [x] **Questions** : une question par chunk, générée à partir du chunk **brut** (jamais du contexte, pour ne pas biaiser en faveur d'un modèle), par un modèle fort indépendant des candidats. Relecture rapide d'un échantillon.
 - [ ] **Conditions comparées** : sans contexte, `qwen3:8b` (référence), puis les candidats. Liste de départ, à revérifier sur le web au démarrage de la phase : `qwen3:0.6b`, `qwen3:1.7b`, `qwen3:4b`, `gemma3:1b`, `llama3.2:1b`, `lfm2` 1,2B. Même prompt que `generate_contextual_embedding`, plus une variante avec `CONTEXTUAL_DOC_TRUNCATION=4000`.
-- [ ] **Mesures qualité** : pour chaque condition, embeddings `bge-m3` de « contexte + chunk », puis recall@5 et MRR des questions sur le pool complet des chunks. Contrôle de format : longueur, absence de préambule, langue du chunk respectée.
-- [ ] **Mesures coût** : secondes par chunk (médiane et p95) à 2, 4 et 6 threads, avec et sans cache de préfixe ; RAM résidente. Le cache de préfixe est le facteur décisif : le document de 8000 caractères est identique d'un chunk à l'autre de la même page, seul le chunk devrait être recalculé.
-- [ ] **Règle de décision**, à valider avec l'opérateur avant de lancer la mesure :
+- [x] **Mesures qualité** : pour chaque condition, embeddings `bge-m3` de « contexte + chunk », puis recall@5 et MRR des questions sur le pool complet des chunks. Contrôle de format : longueur, absence de préambule, langue du chunk respectée.
+- [x] **Mesures coût** : secondes par chunk (médiane et p95) à 2, 4 et 6 threads, avec et sans cache de préfixe ; RAM résidente. Le cache de préfixe est le facteur décisif : le document de 8000 caractères est identique d'un chunk à l'autre de la même page, seul le chunk devrait être recalculé.
+- [x] **Règle de décision**, à valider avec l'opérateur avant de lancer la mesure :
   - gain relatif = (MRR modèle − MRR sans contexte) / (MRR `qwen3:8b` − MRR sans contexte) ;
   - retenir le plus petit modèle avec un gain relatif ≥ 0,8 et un p95 compatible avec le budget ;
   - si le gain de `qwen3:8b` lui-même est inférieur à environ 0,02 de MRR absolu, l'enrichissement ne vaut pas son coût : recommander `USE_CONTEXTUAL_EMBEDDINGS=false`.
 - [ ] **Limite à garder en tête** : la qualité mesurée sur ce PC se transpose telle quelle, pas la latence. Refaire une courte mesure de latence sur l'hôte cible, dans un conteneur limité en cœurs.
-- [ ] Rapport dans `docs/bench/2026-xx-contextual-cpu-models.md` (tableau des conditions, recommandation), décision stockée dans Kleos.
+- [x] Rapport dans `docs/bench/2026-xx-contextual-cpu-models.md` (tableau des conditions, recommandation), décision stockée dans Kleos.
 
 ### Phase 5 : déploiement d'un modèle CPU (conditionnelle)
 
 Seulement si la phase 4 retient un modèle.
+
+**Abandonnée le 2026-09-29.** La phase 4 n'a retenu aucun modèle. Sur 300 chunks, la référence `qwen3:8b` elle-même fait perdre du MRR par rapport à « sans contexte » (-0,045 à 8000, IC95 [-0,128 ; +0,037]). Les candidats plus petits n'ont donc pas été mesurés, et la mesure de latence sur l'hôte cible est devenue sans objet. L'opérateur a désactivé `USE_CONTEXTUAL_EMBEDDINGS` sur LXC 122. Rapport : `docs/bench/2026-09-28-contextual-cpu-models.md`, Kleos #19603.
 
 - [ ] Deux variables de plus : `CONTEXTUAL_LLM_BASE_URL` (repli sur `OLLAMA_BASE_URL`) et `CONTEXTUAL_MODEL` (repli sur `MODEL_CHOICE`), lues par les trois étapes de 3.1. Le rerank et `extract_structured` restent sur leurs variables actuelles.
 - [ ] Service `llama-server` dans `docker-compose.yml` avec `cpus:` et `mem_limit:` explicites. Vérifier la RAM disponible de LXC 122 avant, puisque `mcp-crawl4ai` est déjà limité à 2 GiB.

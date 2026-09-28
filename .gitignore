@@ -28,3 +28,6 @@ test_agentic.py
 KNOWN_ISSUES.md
 .kleos-space
 CLAUDE.local.md
+
+# Generated corpus, benchmark outputs, and local model files.
+bench/contextual/data/
