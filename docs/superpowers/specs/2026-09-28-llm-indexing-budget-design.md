@@ -142,12 +142,13 @@ Défauts provisoires : à 31 s par appel (mesure du 2026-09-21) et 2 workers, 30
 
 - [x] `ENV PYTHONUNBUFFERED=1` dans le `Dockerfile`, lignes de log de début et de fin d'indexation.
 - [x] Table des variables et section « Indexation asynchrone » de `CLAUDE.md`.
-- [ ] Suite complète via le sous-agent `test-runner`, puis `contract-check` contre ce document.
-- [ ] Commit, push, puis déploiement sur LXC 122 :
+- [x] Suite complète via le sous-agent `test-runner`, puis `contract-check` contre ce document. 70/70 sur un Postgres jetable. 6cfcaa6
+- [x] Commit, push, puis déploiement sur LXC 122 : 6cfcaa6
   `pct exec 122 -- bash -c "cd /opt/crawl4ai-rag-mcp && git pull && docker compose up -d --build mcp-crawl4ai"`
   (`--build` est obligatoire : le code vient de l'image, pas d'un volume.)
-- [ ] Validation réelle : relancer `scrape_urls` sur `https://nodejs.org/api/fs.html`. Relever dans les logs Ollama (MCP `docker-inspect`, `docker_logs ollama`, filtrés sur l'IP de LXC 122) l'heure du dernier appel venant de LXC 122, et vérifier qu'elle tombe avant `début + CONTEXTUAL_BUDGET_SECONDS + LLM_TIMEOUT`. Contrôler `stop_reason=budget_*` via `GET /jobs/{id}`.
-- [ ] Section `KNOWN_ISSUES.md` passée en FIXED avec le SHA, `tests/TEST_RESULTS.md` mis à jour, résultat stocké dans Kleos.
+- [x] Validation réelle : relancer `scrape_urls` sur `https://nodejs.org/api/fs.html`. Relever dans les logs Ollama (MCP `docker-inspect`, `docker_logs ollama`, filtrés sur l'IP de LXC 122) l'heure du dernier appel venant de LXC 122, et vérifier qu'elle tombe avant `début + CONTEXTUAL_BUDGET_SECONDS + LLM_TIMEOUT`. Contrôler `stop_reason=budget_*` via `GET /jobs/{id}`.
+  Résultat : `Indexing started` à 21:09:58 UTC, `Indexing finished` à 21:18:12 UTC avec `stop_reason=budget_time calls=9 degraded_fallbacks=117`, 121 chunks insérés dont 113 bruts. Le contrôle côté Ollama n'a pas pu être fait : le conteneur `ollama` n'a écrit aucune ligne de log sur toute la fenêtre du job, alors que 9 appels ont abouti. La borne n'est donc mesurée que côté application.
+- [x] Section `KNOWN_ISSUES.md` passée en FIXED avec le SHA, `tests/TEST_RESULTS.md` mis à jour, résultat stocké dans Kleos (#19598).
 
 ### Phase 4 : banc de modèles CPU (sur ce PC)
 
