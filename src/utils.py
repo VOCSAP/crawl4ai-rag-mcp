@@ -20,11 +20,73 @@ import uuid
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
 
 
-def _get_openai_client() -> openai.OpenAI:
+class LLMBudget:
+    def __init__(self, seconds: Optional[float] = None, max_calls: Optional[int] = None):
+        if seconds is None:
+            seconds = float(os.getenv("CONTEXTUAL_BUDGET_SECONDS", "300"))
+        if max_calls is None:
+            max_calls = int(os.getenv("CONTEXTUAL_MAX_CHUNKS", "60"))
+        self.seconds = seconds
+        self.max_calls = max_calls
+        self._deadline = time.monotonic() + seconds
+        self._max_calls = max_calls
+        self._calls = 0
+        self._fallbacks = 0
+        self._lock = threading.Lock()
+        self._cancelled = threading.Event()
+        self.stop_reason: Optional[str] = None
+
+    @property
+    def calls(self) -> int:
+        with self._lock:
+            return self._calls
+
+    @property
+    def fallbacks(self) -> int:
+        with self._lock:
+            return self._fallbacks
+
+    def record_fallback(self) -> None:
+        with self._lock:
+            self._fallbacks += 1
+
+    def start(self) -> None:
+        with self._lock:
+            if not self._cancelled.is_set():
+                self._deadline = time.monotonic() + self.seconds
+
+    def acquire(self) -> bool:
+        with self._lock:
+            if self._cancelled.is_set():
+                if self.stop_reason is None:
+                    self.stop_reason = "cancelled"
+                return False
+            if time.monotonic() >= self._deadline:
+                self.stop_reason = "budget_time"
+                self._cancelled.set()
+                return False
+            if self._calls >= self._max_calls:
+                self.stop_reason = "budget_calls"
+                self._cancelled.set()
+                return False
+            self._calls += 1
+            return True
+
+    def cancel(self, reason: str = "cancelled") -> None:
+        with self._lock:
+            if self.stop_reason is None:
+                self.stop_reason = reason
+            self._cancelled.set()
+
+
+def _get_openai_client(*, llm_budgeted: bool = False) -> openai.OpenAI:
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434") + "/v1"
     api_key = os.getenv("OPENAI_API_KEY", "ollama")
     timeout = float(os.getenv("LLM_TIMEOUT", "60"))
-    return openai.OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+    kwargs = {"base_url": base_url, "api_key": api_key, "timeout": timeout}
+    if llm_budgeted:
+        kwargs["max_retries"] = int(os.getenv("CONTEXTUAL_LLM_MAX_RETRIES", "0"))
+    return openai.OpenAI(**kwargs)
 
 
 
@@ -226,7 +288,12 @@ def create_embedding(text: str) -> List[float]:
         return [0.0] * EMBEDDING_DIM
 
 
-def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
+def generate_contextual_embedding(
+    full_document: str,
+    chunk: str,
+    *,
+    budget: Optional[LLMBudget] = None,
+) -> Tuple[str, bool]:
     """
     Generate contextual information for a chunk within a document to improve retrieval.
     """
@@ -243,7 +310,10 @@ Here is the chunk we want to situate within the whole document
 </chunk>
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
 
-        client = _get_openai_client()
+        client = _get_openai_client(llm_budgeted=True)
+        if budget is not None and not budget.acquire():
+            budget.record_fallback()
+            return chunk, False
         response = client.chat.completions.create(
             model=model_choice,
             messages=[
@@ -262,6 +332,8 @@ Please give a short succinct context to situate this chunk within the overall do
 
     except Exception as e:
         print(f"Error generating contextual embedding: {e}. Using original chunk instead.")
+        if budget is not None:
+            budget.record_fallback()
         return chunk, False
 
 
@@ -269,8 +341,10 @@ def process_chunk_with_context(args):
     """
     Process a single chunk with contextual embedding (for use with concurrent.futures).
     """
-    url, content, full_document = args
-    return generate_contextual_embedding(full_document, content)
+    url, content, full_document, budget = args
+    if budget is None:
+        return generate_contextual_embedding(full_document, content)
+    return generate_contextual_embedding(full_document, content, budget=budget)
 
 
 def add_documents_to_db(
@@ -283,6 +357,7 @@ def add_documents_to_db(
     *,
     conn=None,
     on_chunk=None,
+    budget: Optional[LLMBudget] = None,
 ) -> int:
     """
     Add documents to the crawled_pages table in batches.
@@ -304,7 +379,7 @@ def add_documents_to_db(
     with _conn_or_pool(conn) as conn:
         return _add_documents_to_db_impl(
             conn, urls, chunk_numbers, contents, metadatas, url_to_full_document,
-            batch_size, on_chunk,
+            batch_size, on_chunk, budget,
         )
 
 
@@ -317,6 +392,7 @@ def _add_documents_to_db_impl(
     url_to_full_document: Dict[str, str],
     batch_size: int,
     on_chunk=None,
+    budget: Optional[LLMBudget] = None,
 ) -> int:
     degraded_chunks = 0
     unique_urls = list(set(urls))
@@ -356,7 +432,7 @@ def _add_documents_to_db_impl(
             for j, content in enumerate(batch_contents):
                 url = batch_urls[j]
                 full_document = url_to_full_document.get(url, "")
-                process_args.append((url, content, full_document))
+                process_args.append((url, content, full_document, budget))
 
             contextual_workers = int(os.getenv("CONTEXTUAL_EMBEDDING_WORKERS", "2"))
             contextual_contents = []
@@ -603,7 +679,13 @@ def extract_code_blocks(markdown_content: str, min_length: int = 1000) -> List[D
     return code_blocks
 
 
-def generate_code_example_summary(code: str, context_before: str, context_after: str) -> str:
+def generate_code_example_summary(
+    code: str,
+    context_before: str,
+    context_after: str,
+    *,
+    budget: Optional[LLMBudget] = None,
+) -> str:
     """
     Generate a summary for a code example using its surrounding context.
     """
@@ -625,7 +707,10 @@ Based on the code example and its surrounding context, provide a concise summary
 """
 
     try:
-        client = _get_openai_client()
+        client = _get_openai_client(llm_budgeted=True)
+        if budget is not None and not budget.acquire():
+            budget.record_fallback()
+            return "Code example for demonstration purposes."
         response = client.chat.completions.create(
             model=model_choice,
             messages=[
@@ -641,6 +726,8 @@ Based on the code example and its surrounding context, provide a concise summary
 
     except Exception as e:
         print(f"Error generating code example summary: {e}")
+        if budget is not None:
+            budget.record_fallback()
         return "Code example for demonstration purposes."
 
 
@@ -805,7 +892,13 @@ def update_source_info(source_id: str, summary: str, word_count: int, *, conn=No
             print(f"Error updating source {source_id}: {e}")
 
 
-def extract_source_summary(source_id: str, content: str, max_length: int = 500) -> str:
+def extract_source_summary(
+    source_id: str,
+    content: str,
+    max_length: int = 500,
+    *,
+    budget: Optional[LLMBudget] = None,
+) -> str:
     """
     Extract a summary for a source from its content using an LLM.
     """
@@ -825,7 +918,10 @@ The above content is from the documentation for '{source_id}'. Please provide a 
 """
 
     try:
-        client = _get_openai_client()
+        client = _get_openai_client(llm_budgeted=True)
+        if budget is not None and not budget.acquire():
+            budget.record_fallback()
+            return default_summary
         response = client.chat.completions.create(
             model=model_choice,
             messages=[
@@ -846,6 +942,8 @@ The above content is from the documentation for '{source_id}'. Please provide a 
 
     except Exception as e:
         print(f"Error generating summary with LLM for {source_id}: {e}. Using default summary.")
+        if budget is not None:
+            budget.record_fallback()
         return default_summary
 
 
@@ -1054,6 +1152,7 @@ CREATE TABLE IF NOT EXISTS index_jobs (
     done          integer NOT NULL DEFAULT 0,
     failed        integer NOT NULL DEFAULT 0,
     error         text,
+    stop_reason   text,
     created_at    timestamptz NOT NULL DEFAULT now(),
     started_at    timestamptz,
     finished_at   timestamptz,
@@ -1072,6 +1171,7 @@ def ensure_index_jobs_table(*, conn=None) -> None:
     with _conn_or_pool(conn) as conn:
         with conn.cursor() as cur:
             cur.execute(_INDEX_JOBS_DDL)
+            cur.execute("ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS stop_reason text")
         conn.commit()
 
 
@@ -1124,17 +1224,27 @@ def bump_index_job(job_id: str, done_delta: int = 0, failed_delta: int = 0, *, c
         conn.commit()
 
 
-def finish_index_job(job_id: str, error: Optional[str] = None, *, conn=None) -> None:
+def finish_index_job(
+    job_id: str,
+    error: Optional[str] = None,
+    stop_reason: Optional[str] = None,
+    *,
+    conn=None,
+) -> None:
     """Close a job, as failed when `error` is given and as done otherwise."""
     with _conn_or_pool(conn) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE index_jobs
-                   SET state = %s, error = %s, finished_at = now(), heartbeat_at = now()
+                   SET state = %s,
+                       error = %s,
+                       stop_reason = %s,
+                       finished_at = now(),
+                       heartbeat_at = now()
                  WHERE id = %s
                 """,
-                ("failed" if error else "done", error, job_id),
+                ("failed" if error else "done", error, stop_reason, job_id),
             )
         conn.commit()
 
@@ -1183,7 +1293,7 @@ def get_index_job(job_id: str, *, conn=None) -> Optional[Dict[str, Any]]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 f"""
-                SELECT id, total, done, failed, error, created_at, started_at,
+                SELECT id, total, done, failed, error, stop_reason, created_at, started_at,
                        finished_at, heartbeat_at, {_LIVE_STATE_SQL} AS state
                   FROM index_jobs WHERE id = %s
                 """,

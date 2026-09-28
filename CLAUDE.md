@@ -36,6 +36,9 @@ Fork de `ToKiDoO/crawl4ai-rag-mcp` adapté pour un déploiement 100% local :
 | `USE_HYBRID_SEARCH` | Active la combinaison vecteur + ILIKE | `true` |
 | `USE_RERANKING` | Active l'étape de rerank | `false` |
 | `USE_CONTEXTUAL_EMBEDDINGS` | Enrichit chaque chunk avec un contexte LLM | `false` |
+| `CONTEXTUAL_BUDGET_SECONDS` | Durée maximale partagée des appels LLM d'une indexation | `300` |
+| `CONTEXTUAL_MAX_CHUNKS` | Nombre maximal partagé d'appels LLM d'une indexation | `60` |
+| `CONTEXTUAL_LLM_MAX_RETRIES` | Retries implicites du client OpenAI pour les appels LLM budgétés | `0` |
 | `USE_AGENTIC_RAG` | Active `search_code_examples` (sinon l'outil retourne une erreur explicite) | `false` |
 | `USE_KNOWLEDGE_GRAPH` | Neo4j -- hors scope. Conditionne aussi l'*enregistrement* des 3 outils Neo4j (voir ci-dessous) | `false` |
 | `DATABASE_URL` | DSN Postgres | aucun -- obligatoire, `_build_db_pool` lève sinon |
@@ -55,6 +58,10 @@ Quand `USE_CONTEXTUAL_EMBEDDINGS=true`, `scrape_urls` rend le fetch immédiateme
 Sur ce chemin différé, deux champs du retour changent de sens : `code_examples_stored` vaut `null` (le compte n'est pas encore connu) et `chunks_stored` est le nombre de chunks **à indexer**, pas encore indexés. `smart_crawl_url` suit la même règle, sauf en mode `query` où l'indexation reste inline puisque cet appel relit ce qu'il vient d'écrire.
 
 Deux raisons, dont une qui n'est pas du confort : le pipeline d'indexation est synchrone de bout en bout, donc l'exécuter dans la coroutine de l'outil gelait l'event loop du serveur pendant toute sa durée, `/health` et les autres sessions MCP comprises. Il passe désormais par `asyncio.to_thread`.
+
+Chaque indexation partage `CONTEXTUAL_BUDGET_SECONDS` et `CONTEXTUAL_MAX_CHUNKS` entre les résumés de sources, les contextes de chunks et les résumés de code. À l'épuisement du budget, les appels LLM restants sont ignorés, mais les chunks sont toujours indexés bruts. Les réponses `GET /jobs/{id}` et le flux `/jobs/{id}/stream` exposent `stop_reason` : `budget_time`, `budget_calls`, `cancelled` ou `client_gone`.
+
+`DELETE /jobs/{id}` annule les futurs appels LLM d'un job `queued` ou `running` et retourne `202`. Les appels déjà commencés et l'insertion des chunks ne sont pas interrompus ; un job inconnu retourne `404` et un job terminal `409`.
 
 La charge réelle vers Ollama vaut `INDEX_JOB_CONCURRENCY x CONTEXTUAL_EMBEDDING_WORKERS`. Monter la concurrence sans monter `mem_limit` reproduit l'OOM kill, et le `memory_threshold_percent` de crawl4ai ne protège de rien ici : il lit `/proc/meminfo`, pas le cgroup (détail en `KNOWN_ISSUES.md` section VII).
 

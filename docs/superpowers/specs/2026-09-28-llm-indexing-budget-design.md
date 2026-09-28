@@ -107,41 +107,41 @@ Défauts provisoires : à 31 s par appel (mesure du 2026-09-21) et 2 workers, 30
 
 ### 3.4 Logs
 
-`ENV PYTHONUNBUFFERED=1` dans le `Dockerfile`, ce qui couvre aussi les conteneurs jetables lancés depuis l'image (Kleos #18515). Au démarrage de l'indexation, une ligne `logging` récapitule budget, plafond, workers et modèle. À l'arrêt, une autre donne la raison, le nombre d'appels faits et le nombre de replis.
+`ENV PYTHONUNBUFFERED=1` dans le `Dockerfile`, ce qui couvre aussi les conteneurs jetables lancés depuis l'image (Kleos #18515). Au démarrage de l'indexation, une ligne de log récapitule budget, plafond, workers et modèle. À l'arrêt, une autre donne la raison, le nombre d'appels faits et le nombre de replis. Ces lignes passent par `print()`, comme le reste du serveur : aucun module n'utilise `logging`, et un `logging.basicConfig` au niveau INFO ferait remonter les journaux des bibliothèques tierces (httpx trace chaque requête). L'horodatage vient de Docker (`docker logs -t`), fiable dès que la sortie n'est plus bufferisée.
 
 ## 4. Plan d'exécution
 
 ### Phase 0 : préalables
 
-- [ ] Lire `KNOWN_ISSUES.md` et ajouter une section OPEN « indexation : charge LLM non bornée » qui renvoie à ce document.
-- [ ] Déclarer la spec agent-forge (`spec-task`) à partir des sections 1 et 3.
-- [ ] Passer la carte `01976add` en `in_progress` et y noter qu'elle est absorbée par ce lot.
+- [x] Lire `KNOWN_ISSUES.md` et ajouter une section OPEN « indexation : charge LLM non bornée » qui renvoie à ce document.
+- [x] Déclarer la spec agent-forge (`spec-task`) à partir des sections 1 et 3.
+- [x] Passer la carte `01976add` en `in_progress` et y noter qu'elle est absorbée par ce lot.
 
 ### Phase 1 : budget LLM (TDD)
 
-- [ ] Test rouge : `LLMBudget` refuse après l'échéance, refuse après N acquisitions, reste correct sous accès concurrents (N threads, exactement `max` acquisitions acceptées).
-- [ ] Implémenter `LLMBudget` dans `src/utils.py`.
-- [ ] Test rouge qui **prouve la borne** : faux client LLM qui dort 0,5 s par appel, 50 chunks, 2 workers, budget de 2 s. Vérifier à la fois :
+- [x] Test rouge : `LLMBudget` refuse après l'échéance, refuse après N acquisitions, reste correct sous accès concurrents (N threads, exactement `max` acquisitions acceptées).
+- [x] Implémenter `LLMBudget` dans `src/utils.py`.
+- [x] Test rouge qui **prouve la borne** : faux client LLM qui dort 0,5 s par appel, 50 chunks, 2 workers, budget de 2 s. Vérifier à la fois :
   - durée de l'indexation ≤ budget + 1 appel + marge ;
   - nombre d'appels LLM ≤ ce que permet le budget ;
   - les 50 chunks sont insérés ;
   - les chunks non enrichis sont comptés comme dégradés.
-- [ ] Brancher le budget dans les trois étapes (`extract_source_summary`, `generate_contextual_embedding`, `generate_code_example_summary`), vérification dans le thread worker.
-- [ ] Test : avec `USE_AGENTIC_RAG=true`, le plafond d'appels couvre aussi les résumés de code (compteur partagé, pas un plafond par étape).
-- [ ] `max_retries=CONTEXTUAL_LLM_MAX_RETRIES` sur le client de ces trois étapes. Test : un faux serveur qui expire n'est appelé qu'une fois.
-- [ ] `stop_reason` : migration `ADD COLUMN IF NOT EXISTS`, écriture en fin de job, exposition dans `GET /jobs/{id}` et le flux. Test sur une table créée sans la colonne.
+- [x] Brancher le budget dans les trois étapes (`extract_source_summary`, `generate_contextual_embedding`, `generate_code_example_summary`), vérification dans le thread worker.
+- [x] Test : avec `USE_AGENTIC_RAG=true`, le plafond d'appels couvre aussi les résumés de code (compteur partagé, pas un plafond par étape).
+- [x] `max_retries=CONTEXTUAL_LLM_MAX_RETRIES` sur le client de ces trois étapes. Test : un faux serveur qui expire n'est appelé qu'une fois.
+- [x] `stop_reason` : migration `ADD COLUMN IF NOT EXISTS`, écriture en fin de job, exposition dans `GET /jobs/{id}` et le flux. Test sur une table créée sans la colonne.
 
 ### Phase 2 : annulation serveur (TDD)
 
-- [ ] Registre `job_id -> LLMBudget`, rempli dans `_dispatch_indexing`, vidé en fin de `_run_index_job`, y compris sur exception.
-- [ ] Test rouge puis implémentation de `DELETE /jobs/{id}` : `202` en cours ou en attente, `404` inconnu, `409` terminé. Un job en attente annulé indexe ses chunks bruts sans aucun appel LLM.
-- [ ] Chemin inline : `CancelledError` → drapeau `client_gone` → exception relancée. Test : annuler la tâche pendant l'indexation, puis vérifier qu'aucun nouvel appel LLM ne part et que les chunks sont insérés.
-- [ ] Consigner sur `da7bb432` le raisonnement de sécurité de la section 3.2.
+- [x] Registre `job_id -> LLMBudget`, rempli dans `_dispatch_indexing`, vidé en fin de `_run_index_job`, y compris sur exception.
+- [x] Test rouge puis implémentation de `DELETE /jobs/{id}` : `202` en cours ou en attente, `404` inconnu, `409` terminé. Un job en attente annulé indexe ses chunks bruts sans aucun appel LLM.
+- [x] Chemin inline : `CancelledError` → drapeau `client_gone` → exception relancée. Test : annuler la tâche pendant l'indexation, puis vérifier qu'aucun nouvel appel LLM ne part et que les chunks sont insérés.
+- [x] Consigner sur `da7bb432` le raisonnement de sécurité de la section 3.2.
 
 ### Phase 3 : logs, documentation, déploiement
 
-- [ ] `ENV PYTHONUNBUFFERED=1` dans le `Dockerfile`, lignes `logging` de début et de fin d'indexation.
-- [ ] Table des variables et section « Indexation asynchrone » de `CLAUDE.md`.
+- [x] `ENV PYTHONUNBUFFERED=1` dans le `Dockerfile`, lignes de log de début et de fin d'indexation.
+- [x] Table des variables et section « Indexation asynchrone » de `CLAUDE.md`.
 - [ ] Suite complète via le sous-agent `test-runner`, puis `contract-check` contre ce document.
 - [ ] Commit, push, puis déploiement sur LXC 122 :
   `pct exec 122 -- bash -c "cd /opt/crawl4ai-rag-mcp && git pull && docker compose up -d --build mcp-crawl4ai"`

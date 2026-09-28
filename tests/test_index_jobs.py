@@ -4,8 +4,13 @@ Runnable without pytest (``python tests/test_index_jobs.py``) so it can run
 inside the mcp-crawl4ai container, which ships no test dependencies. Exercises
 the real index_jobs table against the configured Postgres, not a fake.
 """
+import os
+import re
 import sys
+import uuid
 from pathlib import Path
+
+from psycopg2 import sql
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -17,6 +22,78 @@ def _purge(job_id):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM index_jobs WHERE id = %s", (job_id,))
         conn.commit()
+
+
+def test_startup_migrates_stop_reason_on_an_existing_job_table():
+    class _Cursor:
+        def __init__(self):
+            self.columns = set()
+            self.executed = []
+
+        def execute(self, statement):
+            self.executed.append(statement)
+            if statement == "ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS stop_reason text":
+                self.columns.add("stop_reason")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class _Connection:
+        def __init__(self):
+            self.cursor_instance = _Cursor()
+            self.committed = False
+
+        def cursor(self):
+            return self.cursor_instance
+
+        def commit(self):
+            self.committed = True
+
+    conn = _Connection()
+    utils.ensure_index_jobs_table(conn=conn)
+
+    assert conn.committed
+    assert "ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS stop_reason text" in conn.cursor_instance.executed
+    assert "stop_reason" in conn.cursor_instance.columns, (
+        "existing index_jobs table was not migrated"
+    )
+
+
+def test_new_index_jobs_include_the_stop_reason_column():
+    assert re.search(r"\bstop_reason\s+text\b", utils._INDEX_JOBS_DDL)
+
+
+def test_startup_migrates_stop_reason_on_a_real_legacy_table():
+    schema = f"index_jobs_migration_{uuid.uuid4().hex}"
+    conn = utils.psycopg2.connect(os.environ["DATABASE_URL"])
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+            cur.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+            cur.execute("CREATE TABLE index_jobs (id uuid PRIMARY KEY)")
+        conn.commit()
+
+        utils.ensure_index_jobs_table(conn=conn)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                  FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = 'index_jobs'
+                   AND column_name = 'stop_reason'
+                """
+            )
+            assert cur.fetchone() == (1,), "legacy index_jobs table was not migrated"
+    finally:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
+        conn.commit()
+        conn.close()
 
 
 def test_a_new_job_starts_queued_with_its_total():
@@ -154,6 +231,9 @@ def test_startup_abandons_jobs_left_behind_by_a_dead_process():
 
 
 TESTS = [
+    test_startup_migrates_stop_reason_on_an_existing_job_table,
+    test_new_index_jobs_include_the_stop_reason_column,
+    test_startup_migrates_stop_reason_on_a_real_legacy_table,
     test_a_new_job_starts_queued_with_its_total,
     test_starting_a_job_marks_it_running_and_opens_a_heartbeat,
     test_progress_advances_the_counters_and_touches_the_heartbeat,

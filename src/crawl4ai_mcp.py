@@ -26,6 +26,7 @@ import openai
 import httpx
 import concurrent.futures
 import sys
+import threading
 import time
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
@@ -51,6 +52,7 @@ from utils import (
     abandon_orphaned_index_jobs,
     create_index_job,
     get_index_job,
+    LLMBudget,
     start_index_job,
     bump_index_job,
     finish_index_job,
@@ -513,18 +515,9 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
     }
 
 def process_code_example(args):
-    """
-    Process a single code example to generate its summary.
-    This function is designed to be used with concurrent.futures.
-    
-    Args:
-        args: Tuple containing (code, context_before, context_after)
-        
-    Returns:
-        The generated summary
-    """
-    code, context_before, context_after = args
-    return generate_code_example_summary(code, context_before, context_after)
+    """Summarise one code example; `args` is (code, context_before, context_after, budget)."""
+    code, context_before, context_after, budget = args
+    return generate_code_example_summary(code, context_before, context_after, budget=budget)
 
 @mcp.tool()
 async def search(ctx: Context, query: str, return_raw_markdown: bool = False, num_results: int = 6, batch_size: int = 20, max_concurrent: int = 10, max_rag_workers: int = 5) -> str:
@@ -900,6 +893,8 @@ def _index_crawl_payload(
     all_url_to_full_document: Dict[str, str],
     crawl_results: List[Dict[str, Any]],
     batch_size: int,
+    *,
+    budget: Optional[LLMBudget] = None,
 ) -> int:
     """Index a finished crawl and return how many code examples were stored.
 
@@ -907,10 +902,17 @@ def _index_crawl_payload(
     contextual embeddings on, every chunk costs an LLM call. Runs either inline
     or inside a background job, hence the optional job_id used for progress.
     """
+    budget = budget or LLMBudget()
+    budget.start()
     if source_content_map:
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             source_summary_args = [(source_id, content) for source_id, content in source_content_map.items()]
-            source_summaries = list(executor.map(lambda args: extract_source_summary(args[0], args[1]), source_summary_args))
+            source_summaries = list(
+                executor.map(
+                    lambda args: extract_source_summary(args[0], args[1], budget=budget),
+                    source_summary_args,
+                )
+            )
 
         for (source_id, _), summary in zip(source_summary_args, source_summaries):
             update_source_info(source_id, summary, source_word_counts.get(source_id, 0))
@@ -933,6 +935,7 @@ def _index_crawl_payload(
             # Only fires with contextual embeddings on, which is also the only
             # case that creates a job, so counters never go unreported.
             on_chunk=_on_chunk if job_id else None,
+            budget=budget,
         )
 
     total_code_examples = 0
@@ -950,8 +953,10 @@ def _index_crawl_payload(
 
                 if code_blocks:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                        summary_args = [(block['code'], block['context_before'], block['context_after'])
-                                        for block in code_blocks]
+                        summary_args = [
+                            (block['code'], block['context_before'], block['context_after'], budget)
+                            for block in code_blocks
+                        ]
                         summaries = list(executor.map(process_code_example, summary_args))
 
                     parsed_url = urlparse(source_url)
@@ -1166,6 +1171,7 @@ async def _process_multiple_urls(
                 failed_urls += 1
         
         outcome: Dict[str, int] = {}
+        budget = LLMBudget()
 
         def _index_and_capture(job_id):
             outcome["code_examples"] = _index_crawl_payload(
@@ -1179,9 +1185,14 @@ async def _process_multiple_urls(
                 all_url_to_full_document,
                 crawl_results,
                 batch_size,
+                budget=budget,
             )
 
-        job_id = await _dispatch_indexing(_index_and_capture, total=len(all_contents))
+        job_id = await _dispatch_indexing(
+            _index_and_capture,
+            total=len(all_contents),
+            budget=budget,
+        )
         # None rather than 0 on the deferred path: the count is not yet known,
         # and reporting zero would read as "nothing was stored".
         total_code_examples = outcome.get("code_examples", 0) if job_id is None else None
@@ -1396,6 +1407,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         
         batch_size = 20
         outcome: Dict[str, int] = {}
+        budget = LLMBudget()
         # The query mode below reads back what is indexed here, so deferring
         # would make it search an index that is not filled yet.
         job_id = await _dispatch_indexing(
@@ -1410,9 +1422,11 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 url_to_full_document,
                 crawl_results,
                 batch_size,
+                budget=budget,
             )),
             total=len(contents),
             allow_defer=not (query and len(query) > 0),
+            budget=budget,
         )
         # None rather than 0 on the deferred path: the count is not known yet.
         total_code_examples = outcome.get("code_examples", 0) if job_id is None else None
@@ -3159,6 +3173,8 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
 # A task created with create_task and not referenced anywhere can be collected
 # mid-flight, so background jobs are held here until they finish.
 _BACKGROUND_INDEX_TASKS: set = set()
+_INDEX_JOB_BUDGETS: Dict[str, LLMBudget] = {}
+_INDEX_JOB_BUDGETS_LOCK = threading.Lock()
 _INDEX_SLOTS: Optional[asyncio.Semaphore] = None
 _INDEX_SLOTS_SIZE = 0
 
@@ -3179,7 +3195,30 @@ def _follow_command(job_id: str) -> str:
     return f"curl -sN {base}/jobs/{job_id}/stream"
 
 
-async def _dispatch_indexing(work: Any, total: int, *, allow_defer: bool = True) -> Optional[str]:
+def _log_indexing_started(budget: LLMBudget) -> None:
+    print(
+        "Indexing started: "
+        f"budget_seconds={budget.seconds:g} max_calls={budget.max_calls} "
+        f"workers={os.getenv('CONTEXTUAL_EMBEDDING_WORKERS', '2')} "
+        f"model={os.getenv('MODEL_CHOICE') or 'unset'}"
+    )
+
+
+def _log_indexing_finished(budget: LLMBudget) -> None:
+    print(
+        "Indexing finished: "
+        f"stop_reason={budget.stop_reason or 'none'} calls={budget.calls} "
+        f"degraded_fallbacks={budget.fallbacks}"
+    )
+
+
+async def _dispatch_indexing(
+    work: Any,
+    total: int,
+    *,
+    allow_defer: bool = True,
+    budget: Optional[LLMBudget] = None,
+) -> Optional[str]:
     """Index now, or hand the work to a background job and return its id.
 
     Deferring is only worth its complexity when the work is long, which is
@@ -3189,18 +3228,33 @@ async def _dispatch_indexing(work: Any, total: int, *, allow_defer: bool = True)
     allow_defer=False is for a caller that reads back what it just indexed,
     which would otherwise query an index that is not filled yet.
     """
+    budget = budget or LLMBudget()
+
+    def _logged_work(job_id: Optional[str]) -> None:
+        _log_indexing_started(budget)
+        try:
+            work(job_id)
+        finally:
+            _log_indexing_finished(budget)
+
     if not allow_defer or os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") != "true":
-        await asyncio.to_thread(work, None)
+        try:
+            await asyncio.to_thread(_logged_work, None)
+        except asyncio.CancelledError:
+            budget.cancel("client_gone")
+            raise
         return None
 
     ensure_index_jobs_table()
     job_id = create_index_job(total)
+    with _INDEX_JOB_BUDGETS_LOCK:
+        _INDEX_JOB_BUDGETS[job_id] = budget
 
     async def _guarded() -> None:
         # Acquired before the job is marked running, so a job waiting for a
         # slot stays visibly queued.
         async with _index_slots():
-            await _run_index_job(job_id, work)
+            await _run_index_job(job_id, _logged_work, budget=budget)
 
     task = asyncio.create_task(_guarded())
     _BACKGROUND_INDEX_TASKS.add(task)
@@ -3208,7 +3262,12 @@ async def _dispatch_indexing(work: Any, total: int, *, allow_defer: bool = True)
     return job_id
 
 
-async def _run_index_job(job_id: str, work: Any) -> None:
+async def _run_index_job(
+    job_id: str,
+    work: Any,
+    *,
+    budget: Optional[LLMBudget] = None,
+) -> None:
     """Run one indexing job off the event loop and record how it ended.
 
     `work` is a synchronous callable taking the job id. Injecting it keeps the
@@ -3219,16 +3278,25 @@ async def _run_index_job(job_id: str, work: Any) -> None:
     whose with-block waits on every future), so calling it inline starves every
     other coroutine for as long as it runs, /health included.
     """
-    start_index_job(job_id)
-    beat = asyncio.create_task(_beat_index_job(job_id))
+    budget = budget or LLMBudget()
+    beat = None
+    error = None
     try:
-        await asyncio.to_thread(work, job_id)
-        error = None
-    except Exception as e:
-        error = f"{type(e).__name__}: {e}"
+        try:
+            start_index_job(job_id)
+            beat = asyncio.create_task(_beat_index_job(job_id))
+            await asyncio.to_thread(work, job_id)
+        except asyncio.CancelledError:
+            budget.cancel()
+            raise
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+        finish_index_job(job_id, error=error, stop_reason=budget.stop_reason)
     finally:
-        beat.cancel()
-    finish_index_job(job_id, error=error)
+        if beat is not None:
+            beat.cancel()
+        with _INDEX_JOB_BUDGETS_LOCK:
+            _INDEX_JOB_BUDGETS.pop(job_id, None)
 
 
 async def _beat_index_job(job_id: str) -> None:
@@ -3266,7 +3334,10 @@ _TERMINAL_JOB_STATES = ("done", "failed", "lost")
 
 def _job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
     """JSON-safe view of a job: counters and state only, no crawled content."""
-    payload = {k: job[k] for k in ("id", "state", "total", "done", "failed", "error")}
+    payload = {
+        k: job[k]
+        for k in ("id", "state", "total", "done", "failed", "error", "stop_reason")
+    }
     for k in ("created_at", "started_at", "finished_at", "heartbeat_at"):
         value = job.get(k)
         payload[k] = value.isoformat() if value else None
@@ -3281,6 +3352,27 @@ async def _job_status(request):
     if job is None:
         return JSONResponse({"error": "unknown job"}, status_code=404)
     return JSONResponse(_job_payload(job))
+
+
+@mcp.custom_route("/jobs/{job_id}", methods=["DELETE"])
+async def _cancel_index_job(request):
+    """Stop future LLM calls for an indexing job that has not finished."""
+    from starlette.responses import JSONResponse
+    job_id = request.path_params["job_id"]
+    job = await asyncio.to_thread(get_index_job, job_id)
+    if job is None:
+        return JSONResponse({"error": "unknown job"}, status_code=404)
+    if job["state"] in _TERMINAL_JOB_STATES:
+        return JSONResponse({"error": "job already finished"}, status_code=409)
+    with _INDEX_JOB_BUDGETS_LOCK:
+        budget = _INDEX_JOB_BUDGETS.get(job_id)
+    if budget is None:
+        current_job = await asyncio.to_thread(get_index_job, job_id)
+        if current_job is not None and current_job["state"] in _TERMINAL_JOB_STATES:
+            return JSONResponse({"error": "job already finished"}, status_code=409)
+        return JSONResponse({"error": "job is no longer cancellable"}, status_code=409)
+    budget.cancel()
+    return JSONResponse({"id": job_id, "stop_reason": budget.stop_reason}, status_code=202)
 
 
 async def _stream_job_progress(job_id: str):

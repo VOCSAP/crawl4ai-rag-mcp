@@ -34,6 +34,26 @@ def _purge(job_id):
         conn.commit()
 
 
+def test_job_payload_exposes_the_stop_reason_to_status_and_stream_routes():
+    payload = mod._job_payload(
+        {
+            "id": "job-1",
+            "state": "done",
+            "total": 1,
+            "done": 1,
+            "failed": 1,
+            "error": None,
+            "stop_reason": "budget_calls",
+            "created_at": None,
+            "started_at": None,
+            "finished_at": None,
+            "heartbeat_at": None,
+        }
+    )
+
+    assert payload["stop_reason"] == "budget_calls"
+
+
 def test_reading_an_unknown_job_is_404():
     r = CLIENT.get("/jobs/11111111-2222-3333-4444-555555555555")
     assert r.status_code == 404, f"expected 404, got {r.status_code}"
@@ -54,6 +74,32 @@ def test_reading_a_job_returns_its_counters():
         assert body["id"] == job_id
     finally:
         _purge(job_id)
+
+
+def test_cancelling_a_job_returns_202_or_a_terminal_status(monkeypatch):
+    queued_id = "11111111-2222-3333-4444-555555555551"
+    done_id = "11111111-2222-3333-4444-555555555552"
+    budget = utils.LLMBudget(seconds=60, max_calls=1)
+    jobs = {
+        queued_id: {"id": queued_id, "state": "queued"},
+        done_id: {"id": done_id, "state": "done"},
+    }
+    monkeypatch.setattr(mod, "get_index_job", lambda job_id: jobs.get(job_id))
+    with mod._INDEX_JOB_BUDGETS_LOCK:
+        mod._INDEX_JOB_BUDGETS[queued_id] = budget
+    try:
+        queued = CLIENT.delete(f"/jobs/{queued_id}")
+        assert queued.status_code == 202, f"expected 202, got {queued.status_code}"
+        assert budget.stop_reason == "cancelled"
+
+        done = CLIENT.delete(f"/jobs/{done_id}")
+        assert done.status_code == 409, f"expected 409, got {done.status_code}"
+
+        unknown = CLIENT.delete("/jobs/11111111-2222-3333-4444-555555555553")
+        assert unknown.status_code == 404, f"expected 404, got {unknown.status_code}"
+    finally:
+        with mod._INDEX_JOB_BUDGETS_LOCK:
+            mod._INDEX_JOB_BUDGETS.pop(queued_id, None)
 
 
 def test_following_an_unknown_job_is_404_not_an_empty_stream():
@@ -147,6 +193,7 @@ def test_health_answers_promptly_while_a_job_is_running():
 
 
 TESTS = [
+    test_job_payload_exposes_the_stop_reason_to_status_and_stream_routes,
     test_health_answers_promptly_while_a_job_is_running,
     test_reading_an_unknown_job_is_404,
     test_reading_a_job_returns_its_counters,
