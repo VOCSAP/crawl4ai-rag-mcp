@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP, Context
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, cast
 from urllib.parse import urlparse, urldefrag
 from xml.etree import ElementTree
 from dotenv import load_dotenv
@@ -345,7 +345,10 @@ async def _rerank_remote(query: str, results: List[Dict[str, Any]], content_key:
             max_tokens=64,
             extra_body={"think": False},
         )
-        raw = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
+        if content is None:
+            raise ValueError("Remote reranking response content is null")
+        raw = content.strip()
         indices = [int(x.strip()) - 1 for x in raw.split(",") if x.strip().isdigit()]
         valid = [i for i in indices if 0 <= i < len(results)]
         missing = [i for i in range(len(results)) if i not in valid]
@@ -444,7 +447,7 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
     if resp.status_code == 200:
         try:
             tree = ElementTree.fromstring(resp.content)
-            urls = [loc.text for loc in tree.findall('.//{*}loc')]
+            urls = [cast(str, loc.text) for loc in tree.findall('.//{*}loc')]
         except Exception as e:
             print(f"Error parsing sitemap XML: {e}")
 
@@ -920,8 +923,12 @@ def _index_crawl_payload(
         bump_index_job(job_id)
 
     if all_contents:
-        def _on_chunk(degraded: bool) -> None:
-            bump_index_job(job_id, done_delta=1, failed_delta=1 if degraded else 0)
+        on_chunk = None
+        if job_id:
+            def _on_chunk(degraded: bool) -> None:
+                bump_index_job(job_id, done_delta=1, failed_delta=1 if degraded else 0)
+
+            on_chunk = _on_chunk
 
         # The return value is dropped on purpose: _on_chunk already counted
         # every degraded chunk, so feeding it back would count them twice.
@@ -934,7 +941,7 @@ def _index_crawl_payload(
             batch_size=batch_size,
             # Only fires with contextual embeddings on, which is also the only
             # case that creates a job, so counters never go unreported.
-            on_chunk=_on_chunk if job_id else None,
+            on_chunk=on_chunk,
             budget=budget,
         )
 
@@ -1114,7 +1121,7 @@ async def _process_multiple_urls(
                         meta["url"] = original_url
                         meta["source"] = source_id
                         meta["crawl_type"] = "multi_url"
-                        meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                        meta["crawl_time"] = str(cast(Any, asyncio.current_task()).get_coro().__name__)
                         all_metadatas.append(meta)
                         
                         # Accumulate word counts
@@ -1285,7 +1292,7 @@ async def _process_multiple_urls(
             }, indent=2)
 
 @mcp.tool()
-async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, return_raw_markdown: bool = False, query: List[str] = None, max_rag_workers: int = 5) -> str:
+async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, return_raw_markdown: bool = False, query: List[str] = cast(List[str], None), max_rag_workers: int = 5) -> str:
     """
     Crawl a whole site or section and index it, dispatching on the URL type:
     sitemap.xml crawls every listed URL (plain sitemaps only, NOT sitemap indexes),
@@ -1392,7 +1399,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 meta["url"] = source_url
                 meta["source"] = source_id
                 meta["crawl_type"] = crawl_type
-                meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                meta["crawl_time"] = str(cast(Any, asyncio.current_task()).get_coro().__name__)
                 metadatas.append(meta)
                 
                 # Accumulate word count
@@ -1562,7 +1569,7 @@ async def get_available_sources(ctx: Context) -> str:
         }, indent=2)
 
 @mcp.tool()
-async def perform_rag_query(ctx: Context, query: str, source: str = None, match_count: int = 5) -> str:
+async def perform_rag_query(ctx: Context, query: str, source: str = cast(str, None), match_count: int = 5) -> str:
     """
     Search the already-indexed page content (vector + keyword hybrid).
 
@@ -1575,7 +1582,8 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
     import asyncio
     
     query_start_time = time.time()
-    
+    source_filter = source
+
     try:
         print(f"Starting RAG query: '{query}' with source filter: '{source}'")
         
@@ -1592,23 +1600,20 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
             match_count = 50
         
         # Validate and sanitize source filter
-        if source:
-            source = source.strip()
-            if not source:
-                source = None
-            elif len(source) > 200:  # Reasonable limit
-                return json.dumps({
-                    "success": False,
-                    "error": "Source filter too long (max 200 characters)"
-                }, indent=2)
+        source_filter = source.strip() if source else None
+        if source_filter and len(source_filter) > 200:  # Reasonable limit
+            return json.dumps({
+                "success": False,
+                "error": "Source filter too long (max 200 characters)"
+            }, indent=2)
         
         # Check if hybrid search is enabled
         use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
 
         # Prepare source filter if source is provided and not empty
         # The source parameter should be the source_id (domain) not full URL
-        if source:
-            print(f"[DEBUG] Using source filter: '{source}'")
+        if source_filter:
+            print(f"[DEBUG] Using source filter: '{source_filter}'")
 
         results = []
 
@@ -1626,7 +1631,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                             lambda: search_documents(
                                 query=query,
                                 match_count=match_count * 2,  # Get double to have room for filtering
-                                source_id_filter=source  # Use source_id_filter instead of filter_metadata
+                                source_id_filter=source_filter  # Use source_id_filter instead of filter_metadata
                             )
                         ),
                         timeout=15.0
@@ -1646,7 +1651,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                         asyncio.get_event_loop().run_in_executor(
                             None,
                             lambda: keyword_search_crawled_pages(
-                                query, source, match_count * 2
+                                query, source_filter, match_count * 2
                             )
                         ),
                         timeout=10.0
@@ -1719,7 +1724,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                         lambda: search_documents(
                             query=query,
                             match_count=match_count,
-                            source_id_filter=source  # Use source_id_filter instead of filter_metadata
+                            source_id_filter=source_filter  # Use source_id_filter instead of filter_metadata
                         )
                     ),
                     timeout=20.0
@@ -1785,7 +1790,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
         return json.dumps({
             "success": True,
             "query": query,
-            "source_filter": source,
+            "source_filter": source_filter,
             "search_mode": "hybrid" if use_hybrid_search else "vector",
             "reranking_applied": reranking_applied,
             "results": formatted_results,
@@ -1799,13 +1804,13 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
         return json.dumps({
             "success": False,
             "query": query,
-            "source_filter": source,
+            "source_filter": source_filter,
             "error": f"Search operation failed: {str(e)}",
             "processing_time_seconds": round(processing_time, 2)
         }, indent=2)
 
 @mcp.tool()
-async def search_code_examples(ctx: Context, query: str, source_id: str = None, match_count: int = 5) -> str:
+async def search_code_examples(ctx: Context, query: str, source_id: str = cast(str, None), match_count: int = 5) -> str:
     """
     Search the indexed code examples and their summaries. Requires USE_AGENTIC_RAG=true.
 
@@ -1951,8 +1956,8 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
             "error": str(e)
         }, indent=2)
 
-def _searxng_request(query: str, categories: str, engines: str = None,
-                     language: str = None, pageno: int = 1,
+def _searxng_request(query: str, categories: str, engines: Optional[str] = None,
+                     language: Optional[str] = None, pageno: int = 1,
                      num_results: int = 10) -> dict:
     """Execute a SearXNG search request and return parsed JSON."""
     searxng_url = os.getenv("SEARXNG_URL", "").rstrip("/")
@@ -2006,7 +2011,7 @@ def _searxng_engine_report(data: dict, result_count: int) -> dict:
         for pair in data.get("unresponsive_engines") or []
         if pair
     ]
-    report = {"unresponsive_engines": unresponsive}
+    report: Dict[str, Any] = {"unresponsive_engines": unresponsive}
     if result_count == 0 and unresponsive:
         failed = ", ".join(f"{e['engine']} ({e['reason']})" for e in unresponsive)
         report["warning"] = f"No results, and these engines failed: {failed}"
@@ -2015,7 +2020,7 @@ def _searxng_engine_report(data: dict, result_count: int) -> dict:
 
 @mcp.tool()
 async def searxng_search(ctx: Context, query: str, categories: str = "general",
-                         engines: str = None, language: str = None,
+                         engines: str = cast(str, None), language: str = cast(str, None),
                          pageno: int = 1, num_results: int = 10) -> str:
     """
     Web metasearch via SearXNG: titles, URLs, snippets. No scraping, no indexing.
@@ -2056,8 +2061,8 @@ async def searxng_search(ctx: Context, query: str, categories: str = "general",
 
 
 @mcp.tool()
-async def searxng_images(ctx: Context, query: str, engines: str = None,
-                         language: str = None, pageno: int = 1,
+async def searxng_images(ctx: Context, query: str, engines: str = cast(str, None),
+                         language: str = cast(str, None), pageno: int = 1,
                          num_results: int = 10) -> str:
     """
     Image metasearch via SearXNG. Returns direct image URLs and thumbnails.
@@ -2093,8 +2098,8 @@ async def searxng_images(ctx: Context, query: str, engines: str = None,
 
 
 @mcp.tool()
-async def searxng_news(ctx: Context, query: str, engines: str = None,
-                       language: str = None, pageno: int = 1,
+async def searxng_news(ctx: Context, query: str, engines: str = cast(str, None),
+                       language: str = cast(str, None), pageno: int = 1,
                        num_results: int = 10) -> str:
     """
     Recent news metasearch via SearXNG. Results carry a publishedDate.
@@ -2157,7 +2162,7 @@ async def capture_screenshot(ctx: Context, url: str, wait_for: float = 0.0) -> s
         config = CrawlerRunConfig(
             cache_mode=CacheMode.BYPASS,
             screenshot=True,
-            screenshot_wait_for=wait_for or None,
+            screenshot_wait_for=cast(float, wait_for or None),
         )
         result = await crawler.arun(url=url, config=config)
         err = _crawl_error_payload(url, result)
@@ -2239,7 +2244,7 @@ async def execute_js(ctx: Context, url: str, scripts: Union[str, List[str]]) -> 
 
 @mcp.tool()
 async def get_markdown(ctx: Context, url: str, filter_mode: str = "fit",
-                       query: str = None) -> str:
+                       query: str = cast(str, None)) -> str:
     """
     Convert one URL to Markdown, without indexing it.
 
@@ -2264,7 +2269,7 @@ async def get_markdown(ctx: Context, url: str, filter_mode: str = "fit",
         if mode == "fit":
             content_filter = PruningContentFilter()
         elif mode == "bm25":
-            content_filter = BM25ContentFilter(user_query=query)
+            content_filter = BM25ContentFilter(user_query=cast(str, query))
         md_generator = DefaultMarkdownGenerator(content_filter=content_filter)
 
         crawler = await ctx.request_context.lifespan_context.get_crawler()
@@ -2332,7 +2337,7 @@ def _strip_json_fences(text: str) -> str:
 
 @mcp.tool()
 async def extract_structured(ctx: Context, url: str, instruction: str,
-                             schema: str = None) -> str:
+                             schema: str = cast(str, None)) -> str:
     """
     Crawl a URL to Markdown, then have an LLM pull structured JSON out of it,
     returned under `data`. Requires MODEL_CHOICE to be set.
@@ -2716,7 +2721,7 @@ async def _handle_explore_command(session, command: str, repo_name: str) -> str:
     }, indent=2)
 
 
-async def _handle_classes_command(session, command: str, repo_name: str = None) -> str:
+async def _handle_classes_command(session, command: str, repo_name: Optional[str] = None) -> str:
     """Handle 'classes [repo]' command - list classes"""
     limit = 20
     
@@ -2835,7 +2840,7 @@ async def _handle_class_command(session, command: str, class_name: str) -> str:
     }, indent=2)
 
 
-async def _handle_method_command(session, command: str, method_name: str, class_name: str = None) -> str:
+async def _handle_method_command(session, command: str, method_name: str, class_name: Optional[str] = None) -> str:
     """Handle 'method <name> [class]' command - search for methods"""
     if class_name:
         query = """
@@ -3103,7 +3108,7 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
         max_session_permit=max_concurrent
     )
 
-    results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
+    results = cast(List[Any], await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher))
     kept = []
     for r in results:
         if not (r.success and r.markdown):
@@ -3147,7 +3152,7 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
         if not urls_to_crawl:
             break
 
-        results = await crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher)
+        results = cast(List[Any], await crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher))
         next_level_urls = set()
 
         for result in results:

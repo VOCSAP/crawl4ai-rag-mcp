@@ -1,7 +1,10 @@
 """Behavioral tests for the shared LLM indexing budget."""
+import asyncio
 import concurrent.futures
+import json
 import sys
 import threading
+from types import SimpleNamespace
 import time
 from pathlib import Path
 
@@ -13,22 +16,33 @@ import utils
 
 
 class _ChatResponse:
-    def __init__(self):
-        message = type("Message", (), {"content": "context"})()
+    def __init__(self, content: str | None = "context"):
+        message = type("Message", (), {"content": content})()
         self.choices = [type("Choice", (), {"message": message})()]
 
 
 class _SlowChatClient:
-    def __init__(self, calls, delay=0.0):
+    def __init__(self, calls, delay=0.0, content="context"):
         self._calls = calls
         self._delay = delay
+        self._content = content
         self.chat = self
         self.completions = self
 
     def create(self, **_kwargs):
         self._calls.append(time.monotonic())
         time.sleep(self._delay)
-        return _ChatResponse()
+        return _ChatResponse(self._content)
+
+
+class _AsyncChatClient:
+    def __init__(self, content):
+        self._content = content
+        self.chat = self
+        self.completions = self
+
+    async def create(self, **_kwargs):
+        return _ChatResponse(self._content)
 
 
 class _Cursor:
@@ -128,6 +142,67 @@ def test_budget_counts_fallbacks_across_each_llm_stage(monkeypatch):
     )
     assert budget.calls == 0
     assert budget.fallbacks == 3
+
+
+@pytest.mark.parametrize(
+    ("call_stage", "expected"),
+    [
+        (
+            lambda: utils.extract_source_summary("example.test", "source"),
+            "Content from example.test",
+        ),
+        (
+            lambda: utils.generate_contextual_embedding("source", "chunk"),
+            ("chunk", False),
+        ),
+        (
+            lambda: utils.generate_code_example_summary("code", "before", "after"),
+            "Code example for demonstration purposes.",
+        ),
+    ],
+    ids=["source-summary", "contextual-embedding", "code-example-summary"],
+)
+def test_null_llm_content_uses_the_stage_fallback_without_attribute_error(monkeypatch, capsys, call_stage, expected):
+    monkeypatch.setenv("MODEL_CHOICE", "test-model")
+    monkeypatch.setattr(utils, "_get_openai_client", lambda **_kwargs: _SlowChatClient([], content=None))
+
+    assert call_stage() == expected
+    assert "Error generating" not in capsys.readouterr().out
+
+
+def test_remote_rerank_with_null_content_raises_without_mutating_results(monkeypatch, capsys):
+    import crawl4ai_mcp as mod
+
+    monkeypatch.setattr(mod.openai, "AsyncOpenAI", lambda **_kwargs: _AsyncChatClient(None))
+    results = [{"content": "first"}, {"content": "second"}]
+
+    with pytest.raises(ValueError, match="content"):
+        asyncio.run(mod._rerank_remote("query", results, "content"))
+
+    assert all("rerank_score" not in result for result in results)
+    assert "Error during remote reranking" in capsys.readouterr().out
+
+
+def test_rag_query_keeps_unscored_results_when_reranking_fails(monkeypatch):
+    import crawl4ai_mcp as mod
+
+    results = [{"url": "https://example.test", "content": "first", "metadata": {}, "similarity": 0.5}]
+    monkeypatch.setenv("USE_HYBRID_SEARCH", "false")
+    monkeypatch.setenv("USE_RERANKING", "true")
+    monkeypatch.setattr(mod, "search_documents", lambda **_kwargs: results)
+
+    async def _fail_reranking(*_args, **_kwargs):
+        raise ValueError("remote completion content is null")
+
+    monkeypatch.setattr(mod, "rerank_results", _fail_reranking)
+    context = SimpleNamespace(
+        request_context=SimpleNamespace(lifespan_context=SimpleNamespace(reranking_model=None))
+    )
+
+    payload = json.loads(asyncio.run(mod.perform_rag_query(context, "query")))
+
+    assert payload["reranking_applied"] is False
+    assert "rerank_score" not in results[0]
 
 
 @pytest.mark.parametrize(

@@ -6,7 +6,7 @@ import os
 import threading
 import concurrent.futures
 from contextlib import contextmanager, nullcontext
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, cast
 import json
 from urllib.parse import urlparse
 import psycopg2
@@ -271,6 +271,8 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
                 print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
                 return embeddings
 
+    return []
+
 
 def create_embedding(text: str) -> List[float]:
     """
@@ -315,7 +317,7 @@ Please give a short succinct context to situate this chunk within the overall do
             budget.record_fallback()
             return chunk, False
         response = client.chat.completions.create(
-            model=model_choice,
+            model=cast(str, model_choice),
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
                 {"role": "user", "content": prompt}
@@ -325,8 +327,12 @@ Please give a short succinct context to situate this chunk within the overall do
             extra_body={"think": False}
         )
 
-        context = response.choices[0].message.content.strip()
-        contextual_text = f"{context}\n---\n{chunk}"
+        context = response.choices[0].message.content
+        if context is None:
+            if budget is not None:
+                budget.record_fallback()
+            return chunk, False
+        contextual_text = f"{context.strip()}\n---\n{chunk}"
 
         return contextual_text, True
 
@@ -712,7 +718,7 @@ Based on the code example and its surrounding context, provide a concise summary
             budget.record_fallback()
             return "Code example for demonstration purposes."
         response = client.chat.completions.create(
-            model=model_choice,
+            model=cast(str, model_choice),
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise code example summaries."},
                 {"role": "user", "content": prompt}
@@ -722,7 +728,12 @@ Based on the code example and its surrounding context, provide a concise summary
             extra_body={"think": False}
         )
 
-        return response.choices[0].message.content.strip()
+        summary = response.choices[0].message.content
+        if summary is None:
+            if budget is not None:
+                budget.record_fallback()
+            return "Code example for demonstration purposes."
+        return summary.strip()
 
     except Exception as e:
         print(f"Error generating code example summary: {e}")
@@ -923,7 +934,7 @@ The above content is from the documentation for '{source_id}'. Please provide a 
             budget.record_fallback()
             return default_summary
         response = client.chat.completions.create(
-            model=model_choice,
+            model=cast(str, model_choice),
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise library/tool/framework summaries."},
                 {"role": "user", "content": prompt}
@@ -933,7 +944,12 @@ The above content is from the documentation for '{source_id}'. Please provide a 
             extra_body={"think": False}
         )
 
-        summary = response.choices[0].message.content.strip()
+        summary = response.choices[0].message.content
+        if summary is None:
+            if budget is not None:
+                budget.record_fallback()
+            return default_summary
+        summary = summary.strip()
 
         if len(summary) > max_length:
             summary = summary[:max_length] + "..."
