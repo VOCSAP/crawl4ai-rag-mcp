@@ -3,7 +3,7 @@
 Les issues, specs et tickets de ce repo vivent dans la **roadmap partagée
 claude-peers** (backlog persistant scopé au dépôt, partagé entre toutes les
 sessions Claude). Toutes les opérations passent par les outils MCP
-`mcp__claude-peers__roadmap_*`. Aucune CLI, aucun fichier ticket dans le repo.
+`mcp__kory-roadmap__roadmap_*`. Aucune CLI, aucun fichier ticket dans le repo.
 
 Les GitHub Issues sont désactivées sur `VOCSAP/crawl4ai-rag-mcp` (fork de
 `ToKiDoO/crawl4ai-rag-mcp`) : ne jamais tenter `gh issue`.
