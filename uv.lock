@@ -372,7 +372,7 @@ wheels = [
 
 [[package]]
 name = "crawl4ai"
-version = "0.9.0"
+version = "0.9.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
@@ -409,9 +409,9 @@ dependencies = [
     { name = "unclecode-litellm" },
     { name = "xxhash" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/52/37/9b288598bb0049b918eeb00f029592c748465c8a3e819461e95d8b5f9dab/crawl4ai-0.9.0.tar.gz", hash = "sha256:00c1c3516d9ca24a9b5004523ae67974ace8a5baadc6e92e295afca73f077153", size = 591734, upload-time = "2026-06-18T09:31:08.674Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/ad/44b57b650c3c0afaeea917bd7e6b87a64cd1108be53431690483cde0eb2d/crawl4ai-0.9.5.tar.gz", hash = "sha256:84fa6f4970fbb086a68893c9fb18605a93fcd609c72bee6fbb1d2715924afbff", size = 577411, upload-time = "2026-10-14T10:25:34.554Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c9/19/2d634f26d9ad1281874c503c1043174042fef9af631dc10798f4f22c1544/crawl4ai-0.9.0-py3-none-any.whl", hash = "sha256:1296072d9cd92e79144c6823ed6f27ab3966f16ce44e79fcbe86943b3435c366", size = 499084, upload-time = "2026-06-18T09:31:07.27Z" },
+    { url = "https://files.pythonhosted.org/packages/75/95/a1305b0d4a53334df9f5518ae3d2c09897ae4efa3acff1198bc5fcc4f6cd/crawl4ai-0.9.5-py3-none-any.whl", hash = "sha256:ee2a2a2832d7bf4081289a4d2322be8111331960939e27dd0f921ed69b5e4db4", size = 494036, upload-time = "2026-10-14T10:25:32.935Z" },
 ]
 
 [[package]]
@@ -432,7 +432,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "crawl4ai", specifier = "==0.9.0" },
+    { name = "crawl4ai", specifier = "==0.9.5" },
     { name = "dotenv", specifier = "==0.9.9" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", specifier = "==1.27.2" },

@@ -1,7 +1,7 @@
 services:
   # PostgreSQL with pgvector
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:0.8.7-pg16-bookworm@sha256:0dd3149a06e4579a0d70d8fef9945636cd514005e7237deb27f9b67886f8dc4f
     container_name: postgres-rag
     restart: unless-stopped
     # Server-side guard-rails matching the client-side connection pool in src/utils.py:
@@ -104,7 +104,7 @@ services:
   # Redis Alternative - Valkey
   valkey:
     container_name: valkey
-    image: valkey/valkey:9.1-alpine
+    image: valkey/valkey:9.1.3-alpine@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
     command: valkey-server --save 30 1 --loglevel warning --maxmemory 400mb --maxmemory-policy allkeys-lru
     restart: unless-stopped
     environment:
