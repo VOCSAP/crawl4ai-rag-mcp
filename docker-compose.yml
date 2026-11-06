@@ -130,7 +130,7 @@ services:
   # SearXNG Search Engine
   searxng:
     container_name: searxng
-    image: searxng/searxng:2026.9.23-3cd69d30e@sha256:44924939f9b36580f6957e2c7f1ea8331ebccada9b2eeb9de7ea38f90740eeda
+    image: searxng/searxng:2026.11.5-3e95f6cd2@sha256:ffad724acd87b8dd312328d18da88ddd42e5c4b1d23231594662620053c13cae
     restart: unless-stopped
     networks:
       - searxng

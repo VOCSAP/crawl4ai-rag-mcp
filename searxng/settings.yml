@@ -69,21 +69,45 @@ outgoing:
   pool_maxsize: 20
   enable_http2: true
 
-# Enable engines suitable for API usage
+# Google and qwant deny this IP, brave and google cse rate-limit it: they stay
+# disabled so a general query rests on the engines that answer.
 engines:
   - name: google
     engine: google
     shortcut: g
     use_mobile_ui: false
+    disabled: true
+
+  - name: qwant
+    disabled: true
+
+  - name: brave
+    disabled: true
+
+  - name: google cse
+    disabled: true
 
   - name: bing
     engine: bing
     shortcut: b
-    
+    disabled: false
+
   - name: duckduckgo
     engine: duckduckgo
     shortcut: ddg
-    
+
+  - name: mojeek
+    disabled: false
+
+  - name: startpage
+    disabled: false
+
+  - name: yahoo
+    disabled: false
+
+  - name: presearch
+    disabled: false
+
   - name: wikipedia
     engine: wikipedia
     shortcut: wp
